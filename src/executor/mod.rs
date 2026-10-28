@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(not(windows))]
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
@@ -165,6 +166,7 @@ impl NodeState {
             // From Pending
             (NodeState::Pending, NodeState::Ready)
             | (NodeState::Pending, NodeState::Running)
+            | (NodeState::Pending, NodeState::Completed)
             | (NodeState::Pending, NodeState::Cancelled) => Ok(new),
             // From Ready
             (NodeState::Ready, NodeState::Running) | (NodeState::Ready, NodeState::Cancelled) => {
@@ -286,10 +288,10 @@ impl BuildState {
     fn deps_ready(&self, deps: &[String], graph: &Graph) -> bool {
         let states = self.node_states.lock();
         deps.iter().all(|d| {
-            matches!(
-                states.get(d).copied(),
-                Some(NodeState::Completed) | Some(NodeState::Ready) | Some(NodeState::Running)
-            ) || graph.get_node(d).map(|n| n.is_source).unwrap_or(true)
+            // A dependency is satisfied only once it has actually finished.
+            // `Ready`/`Running` mean the dependency is still in flight.
+            matches!(states.get(d).copied(), Some(NodeState::Completed))
+                || graph.get_node(d).map(|n| n.is_source).unwrap_or(true)
         })
     }
 
@@ -429,12 +431,17 @@ impl Executor {
         // Filter to nodes that need rebuilding
         let mut needs_build: HashSet<String> = HashSet::new();
 
-        // Mark nodes that need building (reverse order to propagate dirty state)
-        for node in topo_order.iter().rev() {
+        // Mark nodes that need building. Walk in topological order (dependencies
+        // first) so a dirty dependency propagates to its dependents.
+        for node in topo_order.iter() {
             let needs_it =
                 node.needs_rebuild() || node.deps.iter().any(|d| needs_build.contains(d));
 
-            if needs_it && !node.is_source {
+            // Phony edges have no command, so they are never scheduled. Treat
+            // them as satisfied aliases rather than dirty nodes: otherwise
+            // order-only phony dependencies (CMake emits one per target) would
+            // force every dependent edge to rebuild.
+            if needs_it && !node.is_source && !node.is_phony {
                 needs_build.insert(node.path.clone());
                 if self.config.explain && node.needs_rebuild() {
                     self.explain_rebuild(node);
@@ -485,6 +492,16 @@ impl Executor {
             self.config.output_mode,
             trace.clone(),
         ));
+
+        // Nodes that don't need rebuilding will never be scheduled, so mark
+        // them as completed up-front. Otherwise `deps_ready` would wait for an
+        // up-to-date dependency forever (e.g. when an output is missing but
+        // all of its inputs are already built).
+        for node in &topo_order {
+            if !needs_build.contains(&node.path) {
+                state.mark_completed(&node.path);
+            }
+        }
 
         // Execute nodes respecting dependencies
         let mut handles = Vec::new();
@@ -848,23 +865,8 @@ async fn execute_node_async(
         tokio::fs::write(rsp, content).await?;
     }
 
-    let shell = if cfg!(target_os = "windows") {
-        "cmd"
-    } else {
-        "sh"
-    };
-    let shell_arg = if cfg!(target_os = "windows") {
-        "/C"
-    } else {
-        "-c"
-    };
-
     // Execute the command
-    let output = Command::new(shell)
-        .arg(shell_arg)
-        .arg(command)
-        .output()
-        .await?;
+    let output = spawn_command(command).await?;
 
     // Print output if any
     if !output.stdout.is_empty() {
@@ -923,5 +925,77 @@ async fn execute_node_async(
             command: command.to_string(),
             code,
         })
+    }
+}
+
+/// Spawn a build command, matching ninja's platform behavior.
+///
+/// On Unix, commands are run through `sh -c`. On Windows, ninja passes the
+/// command line directly to `CreateProcess`, so we do the same. Wrapping the
+/// command in an extra `cmd /C` breaks commands that already invoke
+/// `cmd.exe /C "..."` (as CMake does for linking) because the nested quotes
+/// get escaped twice.
+async fn spawn_command(command: &str) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let command = command.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (program, rest) = split_windows_program(&command);
+            let mut cmd = std::process::Command::new(program);
+            if !rest.is_empty() {
+                // Pass the remainder verbatim so existing quoting is preserved.
+                cmd.raw_arg(rest);
+            }
+            cmd.output()
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("sh").arg("-c").arg(command).output().await
+    }
+}
+
+/// Split a Windows command line into the program path and its arguments.
+///
+/// The program may be quoted if it contains spaces. Everything after the
+/// program is returned unchanged so it can be passed through verbatim.
+#[cfg(windows)]
+fn split_windows_program(command: &str) -> (&str, &str) {
+    let command = command.trim_start();
+
+    if let Some(rest) = command.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return (&rest[..end], &rest[end + 1..]);
+        }
+    }
+
+    match command.find(char::is_whitespace) {
+        Some(i) => (&command[..i], &command[i..]),
+        None => (command, ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pending_node_can_be_marked_completed() {
+        // Nodes that are already up-to-date are marked completed before
+        // scheduling; they never pass through Ready/Running.
+        assert_eq!(
+            NodeState::Pending.transition(NodeState::Completed).unwrap(),
+            NodeState::Completed
+        );
+    }
+
+    #[test]
+    fn test_completed_node_cannot_run_again() {
+        assert!(NodeState::Completed.transition(NodeState::Running).is_err());
     }
 }

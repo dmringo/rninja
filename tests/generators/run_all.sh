@@ -44,6 +44,7 @@ chmod +x "$SCRIPT_DIR"/*.sh
 
 # Run tests
 run_test "CMake" "$SCRIPT_DIR/cmake_test.sh"
+run_test "CMake Multi-Config" "$SCRIPT_DIR/cmake_multiconfig_test.sh"
 run_test "Meson" "$SCRIPT_DIR/meson_test.sh"
 run_test "GN" "$SCRIPT_DIR/gn_test.sh"
 

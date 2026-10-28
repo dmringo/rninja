@@ -163,6 +163,17 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
 
             let mut removed = 0;
             for output in graph.outputs() {
+                // Never remove outputs of phony edges (CMake lists source files
+                // as outputs of a phony edge) or generator rules (the ninja
+                // files CMake regenerates); ninja's clean skips both.
+                if graph
+                    .get_node(output)
+                    .map(|node| node.is_phony || node.generator)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
                 let path = std::path::Path::new(output);
                 if path.exists() {
                     if cli.verbose {
@@ -194,7 +205,7 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             let manifest = parser::parse_file(std::path::Path::new(build_file))?;
 
             for build in &manifest.builds {
-                for output in &build.outputs {
+                for output in build.all_outputs() {
                     println!("{}: {}", output, build.rule);
                 }
             }
@@ -214,9 +225,12 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             };
 
             for target in targets {
-                if let Some(node) = graph.get_node(target) {
-                    if let Some(cmd) = &node.command {
-                        println!("{}", cmd);
+                let order = graph.topological_order(&[target])?;
+                for path in order {
+                    if let Some(node) = graph.get_node(&path) {
+                        if let Some(cmd) = &node.command {
+                            println!("{}", cmd);
+                        }
                     }
                 }
             }

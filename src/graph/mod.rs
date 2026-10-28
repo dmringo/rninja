@@ -343,59 +343,166 @@ impl Graph {
 
     /// Expand variables in a string
     ///
-    /// Variable expansion order (later sources override earlier ones):
+    /// Variable lookup order (first match wins):
     /// 1. Built-in variables ($in, $out, $in_newline, $first_input, $first_output)
     /// 2. Build-specific variables (from build.ninja build statements)
     /// 3. Rule variables (from rule definitions in build.ninja)
     /// 4. Global variables (from top-level assignments in build.ninja)
-    /// 5. Escape sequences ($$ -> $, $space, $:)
     ///
-    /// Note: Expansion is single-pass. Variable values containing $var references
-    /// will not be recursively expanded. Use unique variable names to avoid conflicts.
+    /// Variables that are not defined expand to the empty string, matching
+    /// ninja's behavior.
     fn expand_var(&self, s: &str, build: &Build, rule: Option<&Rule>) -> String {
-        let mut result = s.to_string();
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
 
-        // 1. Built-in variables
-        let in_str = build.inputs.join(" ");
-        let out_str = build.outputs.join(" ");
-        let in_first = build.inputs.first().map(|s| s.as_str()).unwrap_or("");
-        let out_first = build.outputs.first().map(|s| s.as_str()).unwrap_or("");
+        while let Some(c) = chars.next() {
+            if c != '$' {
+                result.push(c);
+                continue;
+            }
 
-        result = result.replace("$in", &in_str);
-        result = result.replace("${in}", &in_str);
-        result = result.replace("$out", &out_str);
-        result = result.replace("${out}", &out_str);
-        result = result.replace("$in_newline", &build.inputs.join("\n"));
-        result = result.replace("$first_input", in_first);
-        result = result.replace("$first_output", out_first);
-
-        // 2. Build-specific variables (highest priority - can override rule/global vars)
-        for (key, value) in &build.variables {
-            result = result.replace(&format!("${}", key), value);
-            result = result.replace(&format!("${{{}}}", key), value);
-        }
-
-        // 3. Rule variables
-        if let Some(rule) = rule {
-            for (key, value) in &rule.variables {
-                result = result.replace(&format!("${}", key), value);
-                result = result.replace(&format!("${{{}}}", key), value);
+            match chars.peek().copied() {
+                // Escape sequences.
+                Some('$') => {
+                    chars.next();
+                    result.push('$');
+                }
+                Some(' ') => {
+                    chars.next();
+                    result.push(' ');
+                }
+                Some(':') => {
+                    chars.next();
+                    result.push(':');
+                }
+                // ${name}
+                Some('{') => {
+                    chars.next();
+                    let mut name = String::new();
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        name.push(c);
+                    }
+                    if closed {
+                        if let Some(value) = self.lookup_var(&name, build, rule) {
+                            result.push_str(&value);
+                        }
+                    } else {
+                        result.push_str("${");
+                        result.push_str(&name);
+                    }
+                }
+                // $name
+                Some(c) if is_variable_char(c) => {
+                    let mut name = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if is_variable_char(c) {
+                            name.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(value) = self.lookup_var(&name, build, rule) {
+                        result.push_str(&value);
+                    }
+                }
+                Some(other) => {
+                    chars.next();
+                    result.push('$');
+                    result.push(other);
+                }
+                None => result.push('$'),
             }
         }
 
-        // 4. Global variables (lowest priority custom variables)
-        for (key, value) in &self.variables {
-            result = result.replace(&format!("${}", key), value);
-            result = result.replace(&format!("${{{}}}", key), value);
-        }
-
-        // 5. Escape sequences (processed last)
-        result = result.replace("$$", "$");
-        result = result.replace("$ ", " ");
-        result = result.replace("$:", ":");
-
         result
     }
+
+    fn lookup_var(&self, name: &str, build: &Build, rule: Option<&Rule>) -> Option<String> {
+        match name {
+            "in" => return Some(escape_paths(&build.inputs, " ")),
+            "in_newline" => return Some(escape_paths(&build.inputs, "\n")),
+            "out" => return Some(escape_paths(&build.outputs, " ")),
+            "first_input" => {
+                return Some(
+                    build
+                        .inputs
+                        .first()
+                        .map(|p| escape_shell_path(p))
+                        .unwrap_or_default(),
+                );
+            }
+            "first_output" => {
+                return Some(
+                    build
+                        .outputs
+                        .first()
+                        .map(|p| escape_shell_path(p))
+                        .unwrap_or_default(),
+                );
+            }
+            _ => {}
+        }
+
+        build
+            .variables
+            .get(name)
+            .or_else(|| rule.and_then(|r| r.variables.get(name)))
+            .or_else(|| self.variables.get(name))
+            .cloned()
+    }
+}
+
+fn escape_paths(paths: &[String], separator: &str) -> String {
+    paths
+        .iter()
+        .map(|p| escape_shell_path(p))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+/// Escape a path for use in a shell command line, matching ninja.
+#[cfg(windows)]
+fn escape_shell_path(path: &str) -> String {
+    if !path.chars().any(|c| c.is_whitespace() || c == '"') {
+        return path.to_string();
+    }
+
+    let mut escaped = String::with_capacity(path.len() + 2);
+    escaped.push('"');
+    for c in path.chars() {
+        if c == '"' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// Escape a path for use in a POSIX shell command line, matching ninja.
+#[cfg(not(windows))]
+fn escape_shell_path(path: &str) -> String {
+    const SPECIAL: &[char] = &[
+        ' ', '\t', '\n', '\'', '"', '\\', '$', '&', '(', ')', '*', ';', '<', '>', '|', '?', '!',
+        '#', '~', '{', '}', '[', ']', '^', '`', '%',
+    ];
+
+    if !path.chars().any(|c| SPECIAL.contains(&c)) {
+        return path.to_string();
+    }
+
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// Whether `c` may appear in a ninja variable name.
+fn is_variable_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
 }
 
 fn escape_dot_id(s: &str) -> String {
@@ -470,5 +577,83 @@ build c: cc a
         let manifest = parser::parse(content).unwrap();
         let result = Graph::from_manifest(&manifest);
         assert!(matches!(result, Err(GraphError::Cycle { .. })));
+    }
+
+    #[test]
+    fn test_undefined_variables_expand_to_empty() {
+        let content = r#"
+rule cc
+    command = echo ${UNDEFINED} [$ALSO_UNDEFINED]
+
+build out: cc in
+"#;
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            graph.get_node("out").unwrap().command.as_deref(),
+            Some("echo  []")
+        );
+    }
+
+    #[test]
+    fn test_variable_names_are_matched_whole() {
+        // A build-level `CONFIG` must not consume the prefix of
+        // `$CONFIGURATION` (CMake's Ninja Multi-Config files use both).
+        let content = r#"
+CONFIGURATION = Debug
+
+rule r
+    command = echo $CONFIGURATION
+
+build out: r
+  CONFIG = Release
+"#;
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            graph.get_node("out").unwrap().command.as_deref(),
+            Some("echo Debug")
+        );
+    }
+
+    #[test]
+    fn test_escape_sequences_in_commands() {
+        let content = r#"
+rule r
+    command = echo $$HOME foo$ bar a$:b
+
+build out: r
+"#;
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            graph.get_node("out").unwrap().command.as_deref(),
+            Some("echo $HOME foo bar a:b")
+        );
+    }
+
+    #[test]
+    fn test_input_paths_with_spaces_are_escaped() {
+        let content = r#"
+rule r
+    command = cc $in -o $out
+
+build out: r a$ b.cpp
+"#;
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        #[cfg(windows)]
+        let expected = "cc \"a b.cpp\" -o out";
+        #[cfg(not(windows))]
+        let expected = "cc 'a b.cpp' -o out";
+
+        assert_eq!(
+            graph.get_node("out").unwrap().command.as_deref(),
+            Some(expected)
+        );
     }
 }
