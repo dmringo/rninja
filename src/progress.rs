@@ -6,7 +6,7 @@
 
 use crate::graph::Graph;
 use crate::output::Styles;
-use console::{truncate_str, Term};
+use console::{measure_text_width, truncate_str, Term};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -507,7 +507,9 @@ fn write_stream(mut stream: impl Write, bytes: &[u8]) {
 
 struct RenderState {
     tree: ProgressTree,
-    last_lines: usize,
+    /// The exact lines currently drawn below the cursor, used to redraw only
+    /// what changed instead of clearing and repainting the whole tree.
+    last_rendered: Vec<String>,
     last_render: Option<Instant>,
     finished: bool,
 }
@@ -533,7 +535,7 @@ impl TreeProgress {
         Some(Arc::new(Self {
             inner: Mutex::new(RenderState {
                 tree,
-                last_lines: 0,
+                last_rendered: Vec::new(),
                 last_render: None,
                 finished: false,
             }),
@@ -680,26 +682,107 @@ impl TreeProgress {
             return;
         }
 
-        self.clear(state);
-        for line in &lines {
-            let text = match line.kind {
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| match line.kind {
                 LineKind::Running => self.styles.progress.apply_to(&line.text).to_string(),
                 LineKind::Failed => self.styles.error.apply_to(&line.text).to_string(),
                 _ => line.text.clone(),
-            };
-            let _ = self.term.write_line(&text);
-        }
-        state.last_lines = lines.len();
+            })
+            .collect();
+
+        self.redraw(state, &rendered);
+        state.last_rendered = rendered;
         let _ = self.term.flush();
     }
 
-    fn clear(&self, state: &mut RenderState) {
-        if state.last_lines == 0 {
+    /// Repaint only the lines that changed. The cursor starts just below the
+    /// tree; walk back to the first line, then overwrite changed lines in
+    /// place. Unchanged lines are left untouched, which avoids the full-block
+    /// flicker of clear-and-repaint on every timer tick.
+    ///
+    /// Padding with spaces is used instead of clear-line escapes because a
+    /// lone `\r` in `clear_line` is translated to a newline by some Windows
+    /// ptys (notably MSYS), which would shift the whole tree.
+    fn redraw(&self, state: &RenderState, new: &[String]) {
+        let (_, cols) = self.term.size();
+        let width = if cols == 0 { 80 } else { cols as usize };
+
+        // Start from the beginning of the line below the tree. The cursor may
+        // not be at column zero after a previous partial repaint.
+        let _ = self.term.move_cursor_left(width);
+
+        let old = &state.last_rendered;
+        if old.is_empty() {
+            for line in new {
+                let _ = self.term.write_line(line);
+            }
             return;
         }
 
-        let _ = self.term.clear_last_lines(state.last_lines);
-        state.last_lines = 0;
+        let _ = self.term.move_cursor_up(old.len());
+
+        let common = old.len().min(new.len());
+        for index in 0..common {
+            let _ = self.term.move_cursor_left(width);
+
+            if old[index] == new[index] {
+                let _ = self.term.move_cursor_down(1);
+                continue;
+            }
+
+            let old_width = measure_text_width(&old[index]);
+            let new_width = measure_text_width(&new[index]);
+            let _ = self.term.write_str(&new[index]);
+            if new_width < old_width {
+                let padding = " ".repeat(old_width - new_width);
+                let _ = self.term.write_str(&padding);
+            }
+            let _ = self.term.move_cursor_down(1);
+        }
+
+        if new.len() > old.len() {
+            for line in &new[old.len()..] {
+                let _ = self.term.move_cursor_left(width);
+                let _ = self.term.write_line(line);
+            }
+        } else if old.len() > new.len() {
+            let extra = old.len() - new.len();
+            for line in &old[new.len()..] {
+                let _ = self.term.move_cursor_left(width);
+                let line_width = measure_text_width(line);
+                if line_width > 0 {
+                    let _ = self.term.write_str(&" ".repeat(line_width));
+                }
+                let _ = self.term.move_cursor_down(1);
+            }
+            let _ = self.term.move_cursor_up(extra);
+        }
+    }
+
+    fn clear(&self, state: &mut RenderState) {
+        if state.last_rendered.is_empty() {
+            return;
+        }
+
+        let (_, cols) = self.term.size();
+        let width = if cols == 0 { 80 } else { cols as usize };
+
+        let _ = self.term.move_cursor_left(width);
+        let _ = self.term.move_cursor_up(state.last_rendered.len());
+
+        for line in &state.last_rendered {
+            let _ = self.term.move_cursor_left(width);
+            let line_width = measure_text_width(line);
+            if line_width > 0 {
+                let _ = self.term.write_str(&" ".repeat(line_width));
+            }
+            let _ = self.term.move_cursor_down(1);
+        }
+
+        let _ = self.term.move_cursor_up(state.last_rendered.len());
+        let _ = self.term.move_cursor_left(width);
+        state.last_rendered.clear();
         let _ = self.term.flush();
     }
 }
