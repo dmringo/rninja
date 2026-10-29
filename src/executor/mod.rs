@@ -5,6 +5,7 @@ use crate::cache::{Cache, CacheConfig};
 use crate::error::ExecError;
 use crate::graph::{Graph, Node};
 use crate::output::{JsonEvent, OutputMode};
+use crate::progress::{ProgressMode, TreeProgress};
 use crate::trace::BuildTrace;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +62,8 @@ pub struct Config {
     pub cache_config: CacheConfig,
     /// Output mode (human or JSON)
     pub output_mode: OutputMode,
+    /// Human-readable progress style
+    pub progress: ProgressMode,
     /// Trace output file (None = disabled)
     pub trace_file: Option<PathBuf>,
     /// Tokio runtime handle (None means create one per run)
@@ -78,6 +81,7 @@ impl Default for Config {
             stats: false,
             cache_config: CacheConfig::from_env(),
             output_mode: OutputMode::Human,
+            progress: ProgressMode::Plain,
             trace_file: None,
             runtime: None,
         }
@@ -206,6 +210,8 @@ struct BuildState {
     cache_misses: AtomicUsize,
     /// Output mode for progress reporting
     output_mode: OutputMode,
+    /// Optional live dependency-tree progress renderer
+    tree_progress: Option<Arc<TreeProgress>>,
     /// Build trace for chrome://tracing output
     trace: Arc<BuildTrace>,
 }
@@ -216,6 +222,7 @@ impl BuildState {
         total: usize,
         pools: &HashMap<String, usize>,
         output_mode: OutputMode,
+        tree_progress: Option<Arc<TreeProgress>>,
         trace: Arc<BuildTrace>,
     ) -> Self {
         let mut pool_sems = HashMap::new();
@@ -234,6 +241,7 @@ impl BuildState {
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             output_mode,
+            tree_progress,
             trace,
         }
     }
@@ -273,6 +281,44 @@ impl BuildState {
 
     fn mark_cancelled(&self, path: &str) {
         self.apply_transition(path, NodeState::Cancelled);
+    }
+
+    fn report_task_started(&self, path: &str) {
+        if let Some(tree) = &self.tree_progress {
+            tree.task_started(path);
+        }
+    }
+
+    fn report_task_finished(&self, path: &str, success: bool) {
+        if let Some(tree) = &self.tree_progress {
+            tree.task_finished(path, success);
+        }
+    }
+
+    fn write_output(&self, stdout: &[u8], stderr: &[u8]) {
+        if let Some(tree) = &self.tree_progress {
+            tree.write_output(stdout, stderr);
+            return;
+        }
+
+        if !stdout.is_empty() {
+            if let Err(e) = std::io::stdout().write_all(stdout) {
+                debug!("Failed to write to stdout: {}", e);
+            }
+        }
+        if !stderr.is_empty() {
+            if let Err(e) = std::io::stderr().write_all(stderr) {
+                debug!("Failed to write to stderr: {}", e);
+            }
+        }
+    }
+
+    fn report_permanent_error(&self, message: &str) {
+        if let Some(tree) = &self.tree_progress {
+            tree.permanent_error(message);
+        } else {
+            eprint!("{}", message);
+        }
     }
 
     fn has_failed_dep(&self, deps: &[String]) -> bool {
@@ -394,6 +440,7 @@ impl Executor {
             tokio::task::JoinError,
         >,
         cache: &Option<Cache>,
+        state: &BuildState,
     ) {
         match result {
             Ok(Ok((path, executed, cache_key))) => {
@@ -408,14 +455,15 @@ impl Executor {
                 }
             }
             Ok(Err((path, e))) => {
-                eprintln!("FAILED: {}", path);
+                let mut message = format!("FAILED: {}\n", path);
                 if let ExecError::CommandFailed { command, code } = &e {
-                    eprintln!("Command: {}", command);
-                    eprintln!("Exit code: {}", code);
+                    message.push_str(&format!("Command: {}\n", command));
+                    message.push_str(&format!("Exit code: {}\n", code));
                 }
+                state.report_permanent_error(&message);
             }
             Err(e) => {
-                eprintln!("Task error: {}", e);
+                state.report_permanent_error(&format!("Task error: {}\n", e));
             }
         }
     }
@@ -484,12 +532,26 @@ impl Executor {
         let trace = Arc::new(BuildTrace::new(self.config.trace_file.is_some()));
         trace.add_metadata("process_name", "rninja");
 
+        // Create the optional live tree renderer. It falls back to the plain
+        // output path when stderr is not a terminal.
+        let tree_progress = if self.config.output_mode == OutputMode::Human
+            && self.config.progress == ProgressMode::Tree
+        {
+            TreeProgress::new(graph, targets, &needs_build)
+        } else {
+            None
+        };
+        if let Some(tree) = &tree_progress {
+            tree.start();
+        }
+
         // Create shared state
         let state = Arc::new(BuildState::new(
             self.config.parallelism,
             total,
             &pools,
             self.config.output_mode,
+            tree_progress,
             trace.clone(),
         ));
 
@@ -602,9 +664,13 @@ impl Executor {
                     let idx = state.next_progress();
                     match state.output_mode {
                         OutputMode::Human => {
-                            let desc = description.as_deref().unwrap_or("cached");
-                            println!("[{}/{}] {} (cached)", idx, state.total, desc);
-                            let _ = std::io::stdout().flush();
+                            if let Some(tree) = &state.tree_progress {
+                                tree.cache_hit(&path);
+                            } else {
+                                let desc = description.as_deref().unwrap_or("cached");
+                                println!("[{}/{}] {} (cached)", idx, state.total, desc);
+                                let _ = std::io::stdout().flush();
+                            }
                         }
                         OutputMode::Json => {
                             JsonEvent::CacheHit {
@@ -632,6 +698,7 @@ impl Executor {
                         Err(e) => {
                             tracing::error!("Failed to acquire semaphore: {}", e);
                             state.mark_failed(&path);
+                            state.report_task_finished(&path, false);
                             return Err((
                                 path,
                                 ExecError::SpawnError(std::io::Error::other(format!(
@@ -643,6 +710,7 @@ impl Executor {
                     };
 
                     state.mark_running(&path);
+                    state.report_task_started(&path);
 
                     // Allocate thread ID for tracing
                     let tid = state.allocate_tid();
@@ -678,10 +746,12 @@ impl Executor {
                     match result {
                         Ok(executed) => {
                             state.mark_completed(&path);
+                            state.report_task_finished(&path, true);
                             Ok((path, executed, cache_key))
                         }
                         Err(e) => {
                             state.mark_failed(&path);
+                            state.report_task_finished(&path, false);
                             Err((path, e))
                         }
                     }
@@ -700,14 +770,14 @@ impl Executor {
                 let (result, _idx, remaining) = futures::future::select_all(handles).await;
                 handles = remaining;
 
-                Self::handle_task_result(result, &self.cache);
+                Self::handle_task_result(result, &self.cache, &state);
             }
         }
 
         // Wait for remaining handles
         for handle in handles {
             let result = handle.await;
-            Self::handle_task_result(result, &self.cache);
+            Self::handle_task_result(result, &self.cache, &state);
         }
 
         let fail_count = state.fail_count.load(Ordering::SeqCst);
@@ -724,6 +794,25 @@ impl Executor {
             cache_misses,
             total_time: start.elapsed(),
         };
+
+        if let Some(tree) = &state.tree_progress {
+            tree.finish();
+
+            // The tree is transient, so leave one permanent line confirming
+            // that the build finished and how much work was done.
+            if fail_count == 0 {
+                let done = finish_count.saturating_sub(fail_count);
+                let noun = if done == 1 { "task" } else { "tasks" };
+                if cache_hits > 0 {
+                    eprintln!(
+                        "ninja: finished {} {} ({} from cache)",
+                        done, noun, cache_hits
+                    );
+                } else {
+                    eprintln!("ninja: finished {} {}", done, noun);
+                }
+            }
+        }
 
         if self.config.stats {
             stats.print(self.config.output_mode);
@@ -831,17 +920,28 @@ async fn execute_node_async(
 
     state.record_cache_miss();
 
-    // Print status
+    // Print status. Tree progress is updated by the executor when the task is
+    // actually scheduled, so it is only printed here in plain mode. Verbose
+    // tree mode emits command lines above the tree instead of using them as
+    // tree labels, keeping long commands readable.
     match state.output_mode {
         OutputMode::Human => {
-            let desc = description.unwrap_or(command);
-            if config.verbose {
-                println!("[{}/{}] {}", idx, total, command);
+            if let Some(tree) = &state.tree_progress {
+                if config.verbose {
+                    // The tree already shows completed/total progress, so the
+                    // command log does not repeat a different counter.
+                    tree.write_status_line(command);
+                }
             } else {
-                println!("[{}/{}] {}", idx, total, desc);
-            }
-            if let Err(e) = std::io::stdout().flush() {
-                debug!("Failed to flush stdout: {}", e);
+                let desc = description.unwrap_or(command);
+                if config.verbose {
+                    println!("[{}/{}] {}", idx, total, command);
+                } else {
+                    println!("[{}/{}] {}", idx, total, desc);
+                }
+                if let Err(e) = std::io::stdout().flush() {
+                    debug!("Failed to flush stdout: {}", e);
+                }
             }
         }
         OutputMode::Json => {
@@ -867,17 +967,14 @@ async fn execute_node_async(
 
     // Execute the command
     let output = spawn_command(command).await?;
+    let success = output.status.success();
 
-    // Print output if any
-    if !output.stdout.is_empty() {
-        if let Err(e) = std::io::stdout().write_all(&output.stdout) {
-            debug!("Failed to write to stdout: {}", e);
-        }
-    }
-    if !output.stderr.is_empty() {
-        if let Err(e) = std::io::stderr().write_all(&output.stderr) {
-            debug!("Failed to write to stderr: {}", e);
-        }
+    // Print output if any, keeping the live progress tree intact. Tree mode
+    // treats successful task output as noise: the tree already shows what is
+    // running, so successful output is only shown with --verbose. Failed
+    // tasks always surface their output so diagnostics are never hidden.
+    if should_emit_output(state.tree_progress.is_some(), success, config.verbose) {
+        state.write_output(&output.stdout, &output.stderr);
     }
 
     // Parse depfile if present
@@ -894,7 +991,7 @@ async fn execute_node_async(
         }
     }
 
-    if output.status.success() {
+    if success {
         // Emit success event for JSON mode
         if state.output_mode == OutputMode::Json {
             JsonEvent::TargetFinished {
@@ -926,6 +1023,15 @@ async fn execute_node_async(
             code,
         })
     }
+}
+
+/// Whether captured command output should be written to the terminal.
+///
+/// Plain mode matches Ninja and always prints output. Tree mode keeps the
+/// display quiet by default: output from successful tasks is hidden unless
+/// `--verbose` is set, while failed tasks always print their output.
+fn should_emit_output(tree_mode: bool, success: bool, verbose: bool) -> bool {
+    !tree_mode || !success || verbose
 }
 
 /// Spawn a build command, matching ninja's platform behavior.
@@ -997,5 +1103,20 @@ mod tests {
     #[test]
     fn test_completed_node_cannot_run_again() {
         assert!(NodeState::Completed.transition(NodeState::Running).is_err());
+    }
+
+    #[test]
+    fn test_task_output_policy() {
+        // Plain mode always prints output, matching Ninja.
+        assert!(should_emit_output(false, true, false));
+        assert!(should_emit_output(false, false, false));
+
+        // Tree mode hides successful output unless verbose.
+        assert!(!should_emit_output(true, true, false));
+        assert!(should_emit_output(true, true, true));
+
+        // Failures always print their output so diagnostics are visible.
+        assert!(should_emit_output(true, false, false));
+        assert!(should_emit_output(true, false, true));
     }
 }

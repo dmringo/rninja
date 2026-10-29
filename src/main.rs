@@ -15,6 +15,7 @@ mod graph;
 mod metrics;
 mod output;
 mod parser;
+mod progress;
 mod server;
 mod trace;
 
@@ -90,6 +91,10 @@ fn run_build(cli: &Cli) -> Result<()> {
     } else {
         output::OutputMode::Human
     };
+    let progress_mode = match cli.progress.as_str() {
+        "tree" => progress::ProgressMode::Tree,
+        _ => progress::ProgressMode::Plain,
+    };
 
     // Create executor and run
     let executor = executor::Executor::new(executor::Config {
@@ -101,6 +106,7 @@ fn run_build(cli: &Cli) -> Result<()> {
         stats: cli.stats(),
         cache_config: cache::CacheConfig::from_env(),
         output_mode,
+        progress: progress_mode,
         trace_file: cli.trace.as_ref().map(std::path::PathBuf::from),
         runtime: None,
     });

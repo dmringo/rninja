@@ -37,6 +37,15 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
+    /// Progress display: plain lines or a live dependency tree
+    #[arg(
+        long = "progress",
+        value_name = "MODE",
+        default_value = "plain",
+        value_parser = ["plain", "tree"]
+    )]
+    pub progress: String,
+
     /// Debugging mode (see -d list for modes)
     #[arg(short = 'd', long = "debug", value_name = "MODE")]
     pub debug: Option<String>,

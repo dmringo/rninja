@@ -16,5 +16,6 @@ pub mod graph;
 pub mod metrics;
 pub mod output;
 pub mod parser;
+pub mod progress;
 pub mod server;
 pub mod trace;
