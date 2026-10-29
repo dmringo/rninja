@@ -619,6 +619,27 @@ build out: r
     }
 
     #[test]
+    fn test_trailing_space_in_launcher_variable_is_preserved() {
+        // CMake emits `LAUNCHER = ...ccache ` with a trailing space and uses
+        // `${LAUNCHER}${CODE_CHECK}gcc`; without the space the final token is
+        // `ccachegcc` (or `ccache/path/to/gcc`).
+        let content = concat!(
+            "rule cc\n",
+            "    command = ${LAUNCHER}${CODE_CHECK}gcc $in -o $out\n",
+            "build out.o: cc in.c\n",
+            "    LAUNCHER = /usr/bin/ccache ccache \n",
+            "    CODE_CHECK =\n",
+        );
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            graph.get_node("out.o").unwrap().command.as_deref(),
+            Some("/usr/bin/ccache ccache gcc in.c -o out.o")
+        );
+    }
+
+    #[test]
     fn test_escape_sequences_in_commands() {
         let content = r#"
 rule r

@@ -28,6 +28,22 @@ fn parse_with_base(content: &str, base_dir: Option<PathBuf>) -> Result<Manifest,
     parser.parse()
 }
 
+/// Split an assignment line into its key and value.
+///
+/// Indentation and whitespace after `=` are not part of the value, but
+/// trailing whitespace is significant. CMake relies on this for launcher
+/// variables such as `LAUNCHER = ccache `, which are concatenated directly
+/// with the compiler path as `${LAUNCHER}${CODE_CHECK}...`.
+fn split_assignment(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let (key, value) = line.split_once('=')?;
+    Some((key.trim(), value.trim_start()))
+}
+
 struct Parser<'a> {
     lexer: lexer::Lexer<'a>,
     manifest: Manifest,
@@ -51,7 +67,9 @@ impl<'a> Parser<'a> {
         while let Some(line) = self.lexer.next_line() {
             self.current_line = self.lexer.line_number();
 
-            let line = line.trim();
+            // Strip indentation, but keep trailing whitespace: variable
+            // values may intentionally end with spaces (CMake launchers do).
+            let line = line.trim_start();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -104,24 +122,17 @@ impl<'a> Parser<'a> {
             })?;
             self.current_line = self.lexer.line_number();
 
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim();
+            if let Some((key, value)) = split_assignment(&line) {
                 match key {
                     "command" => rule.command = Some(value.to_string()),
                     "description" => rule.description = Some(value.to_string()),
                     "depfile" => rule.depfile = Some(value.to_string()),
-                    "deps" => rule.deps = Some(value.to_string()),
-                    "generator" => rule.generator = value == "1" || value == "true",
-                    "restat" => rule.restat = value == "1" || value == "true",
+                    "deps" => rule.deps = Some(value.trim().to_string()),
+                    "generator" => rule.generator = value.trim() == "1" || value.trim() == "true",
+                    "restat" => rule.restat = value.trim() == "1" || value.trim() == "true",
                     "rspfile" => rule.rspfile = Some(value.to_string()),
                     "rspfile_content" => rule.rspfile_content = Some(value.to_string()),
-                    "pool" => rule.pool = Some(value.to_string()),
+                    "pool" => rule.pool = Some(value.trim().to_string()),
                     _ => {
                         // Store unknown variables for later expansion
                         rule.variables.insert(key.to_string(), value.to_string());
@@ -195,15 +206,8 @@ impl<'a> Parser<'a> {
             })?;
             self.current_line = self.lexer.line_number();
 
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some((key, value)) = line.split_once('=') {
-                build
-                    .variables
-                    .insert(key.trim().to_string(), value.trim().to_string());
+            if let Some((key, value)) = split_assignment(&line) {
+                build.variables.insert(key.to_string(), value.to_string());
             }
         }
 
@@ -234,13 +238,8 @@ impl<'a> Parser<'a> {
             })?;
             self.current_line = self.lexer.line_number();
 
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "depth" {
+            if let Some((key, value)) = split_assignment(&line) {
+                if key == "depth" {
                     pool.depth = value.trim().parse().unwrap_or(1);
                 }
             }
@@ -342,10 +341,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_variable(&mut self, line: &str) -> Result<(), ParseError> {
-        if let Some((key, value)) = line.split_once('=') {
+        if let Some((key, value)) = split_assignment(line) {
             self.manifest
                 .variables
-                .insert(key.trim().to_string(), value.trim().to_string());
+                .insert(key.to_string(), value.to_string());
         }
         Ok(())
     }
@@ -607,6 +606,38 @@ build $builddir/foo.o: cc foo.c
         let manifest = parse(content).unwrap();
         assert_eq!(manifest.variables.get("builddir"), Some(&"out".to_string()));
         assert_eq!(manifest.builds[0].outputs, vec!["out/foo.o"]);
+    }
+
+    #[test]
+    fn test_parse_preserves_significant_trailing_whitespace() {
+        // CMake's Ninja generator emits `LAUNCHER = ...ccache ` with a
+        // trailing space, then concatenates it as `${LAUNCHER}${CODE_CHECK}`.
+        // Trimming the value would merge the launcher and compiler tokens.
+        let content = concat!(
+            "global = global value \n",
+            "rule cc\n",
+            "    command = ${LAUNCHER}${CODE_CHECK}gcc $in -o $out\n",
+            "    cflags = -O2 \n",
+            "build out.o: cc in.c\n",
+            "    LAUNCHER = /usr/bin/ccache ccache \n",
+            "    CODE_CHECK =\n",
+        );
+
+        let manifest = parse(content).unwrap();
+        assert_eq!(
+            manifest.variables.get("global"),
+            Some(&"global value ".to_string())
+        );
+
+        let rule = &manifest.rules["cc"];
+        assert_eq!(rule.variables.get("cflags"), Some(&"-O2 ".to_string()));
+
+        let build = &manifest.builds[0];
+        assert_eq!(
+            build.variables.get("LAUNCHER"),
+            Some(&"/usr/bin/ccache ccache ".to_string())
+        );
+        assert_eq!(build.variables.get("CODE_CHECK"), Some(&"".to_string()));
     }
 
     #[test]
