@@ -133,9 +133,18 @@ impl ProgressTree {
             failed: false,
         }];
         let mut index_by_path = HashMap::new();
+        let mut expanded_synthetics = HashSet::new();
 
         for target in targets {
-            add_dependency(target, 0, graph, scheduled, &mut nodes, &mut index_by_path);
+            add_dependency(
+                target,
+                0,
+                graph,
+                scheduled,
+                &mut nodes,
+                &mut index_by_path,
+                &mut expanded_synthetics,
+            );
         }
 
         if nodes[0].children.is_empty() {
@@ -408,6 +417,7 @@ fn add_node(
     scheduled: &HashSet<String>,
     nodes: &mut Vec<ProgressNode>,
     index_by_path: &mut HashMap<String, usize>,
+    expanded_synthetics: &mut HashSet<String>,
 ) -> Option<(usize, bool)> {
     if let Some(&index) = index_by_path.get(path) {
         return Some((index, false));
@@ -447,7 +457,15 @@ fn add_node(
 
     let deps = graph_node.deps.clone();
     for dep in deps {
-        add_dependency(&dep, index, graph, scheduled, nodes, index_by_path);
+        add_dependency(
+            &dep,
+            index,
+            graph,
+            scheduled,
+            nodes,
+            index_by_path,
+            expanded_synthetics,
+        );
     }
 
     Some((index, true))
@@ -464,6 +482,11 @@ fn is_cmake_order_dep(path: &str) -> bool {
         .starts_with("cmake_object_order_depends_")
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYNTHETIC_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn add_dependency(
     path: &str,
     parent: usize,
@@ -471,19 +494,42 @@ fn add_dependency(
     scheduled: &HashSet<String>,
     nodes: &mut Vec<ProgressNode>,
     index_by_path: &mut HashMap<String, usize>,
+    expanded_synthetics: &mut HashSet<String>,
 ) {
     if is_cmake_order_dep(path) {
+        // These barriers are shared by many objects. Expanding each one once
+        // keeps tree construction linear instead of walking shared synthetic
+        // diamonds repeatedly.
+        if !expanded_synthetics.insert(path.to_string()) {
+            return;
+        }
+        #[cfg(test)]
+        SYNTHETIC_EXPANSIONS.with(|count| count.set(count.get() + 1));
         if let Some(node) = graph.get_node(path) {
             for dep in &node.deps {
-                add_dependency(dep, parent, graph, scheduled, nodes, index_by_path);
+                add_dependency(
+                    dep,
+                    parent,
+                    graph,
+                    scheduled,
+                    nodes,
+                    index_by_path,
+                    expanded_synthetics,
+                );
             }
         }
         return;
     }
 
-    if let Some((child, created)) =
-        add_node(path, Some(parent), graph, scheduled, nodes, index_by_path)
-    {
+    if let Some((child, created)) = add_node(
+        path,
+        Some(parent),
+        graph,
+        scheduled,
+        nodes,
+        index_by_path,
+        expanded_synthetics,
+    ) {
         if created {
             nodes[parent].children.push(child);
         }
@@ -997,6 +1043,43 @@ build app: phony obj.o
             "generated header should remain visible: {rendered:?}"
         );
         assert_eq!(rendered[0], "[0/2] build");
+    }
+
+    #[test]
+    fn synthetic_barriers_are_expanded_once() {
+        let mut manifest = String::from(
+            "rule gen\n    command = gen $out\n    description = GEN $out\n\n\
+             build leaf: gen\n",
+        );
+        let mut previous = "leaf".to_string();
+        for level in 1..=10 {
+            let left = format!("cmake_object_order_depends_target_left{level}");
+            let right = format!("cmake_object_order_depends_target_right{level}");
+            manifest.push_str(&format!("build {left}: phony || {previous}\n"));
+            manifest.push_str(&format!("build {right}: phony || {previous}\n"));
+            previous = format!("cmake_object_order_depends_target_root{level}");
+            manifest.push_str(&format!("build {previous}: phony || {left} {right}\n"));
+        }
+
+        let mut scheduled = vec!["leaf".to_string()];
+        let mut objects = Vec::new();
+        for index in 1..=20 {
+            let object = format!("obj{index}.o");
+            manifest.push_str(&format!("build {object}: gen || {previous}\n"));
+            scheduled.push(object.clone());
+            objects.push(object);
+        }
+        manifest.push_str(&format!("build all: phony {}\n", objects.join(" ")));
+
+        let scheduled_refs: Vec<&str> = scheduled.iter().map(String::as_str).collect();
+        SYNTHETIC_EXPANSIONS.with(|count| count.set(0));
+        let _tree = tree_for(&manifest, &["all"], &scheduled_refs);
+
+        let expansions = SYNTHETIC_EXPANSIONS.with(|count| count.get());
+        assert!(
+            expansions <= 30,
+            "expanded {expansions} synthetic barriers; expected each of the 30 to be visited once"
+        );
     }
 
     #[test]
