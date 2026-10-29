@@ -278,7 +278,7 @@ rninja [OPTIONS] [TARGETS...]
 | `--verbose` | `-v` | Verbose output |
 | `--quiet` | | Suppress output |
 | `--jobs N` | `-j N` | Parallel jobs (0=auto) |
-| `--keep-going` | `-k` | Continue on errors |
+| `--keep-going N` | `-k N` | Stop after N failed jobs (default 1; 0 = unlimited) |
 | `--dry-run` | `-n` | Don't execute commands |
 | `--explain` | | Explain why targets rebuild |
 | `--progress MODE` | | Progress display: `plain` (default) or `tree` (live dependency tree; interactive terminals only) |
@@ -287,6 +287,10 @@ rninja [OPTIONS] [TARGETS...]
 | `--daemon-socket PATH` | | Custom daemon socket |
 | `-f FILE` | | Use FILE as build file |
 | `-C DIR` | | Change to DIR before building |
+
+`-k` stops launching new jobs once the failure limit is reached, but jobs that
+are already running are allowed to finish. Up to `-j` failures can therefore be
+reported at once.
 
 To watch the live tree against a generated nested graph (requires a terminal):
 
