@@ -105,8 +105,11 @@ case "$(uname -s)" in
     *) EXE="" ;;
 esac
 
+CACHE_DIR="$TEST_DIR/cache"
+
 run_rninja() {
-    (cd "$BUILD" && RNINJA_CACHE_ENABLED=0 "$RNINJA" --no-daemon -j 4)
+    (cd "$BUILD" && RNINJA_CACHE_ENABLED=1 RNINJA_CACHE_DIR="$CACHE_DIR" \
+        "$RNINJA" --no-daemon -j 4)
 }
 
 check_app() {
@@ -148,6 +151,23 @@ EOF
         exit 1
     fi
     check_app 45
+
+    echo -e "${YELLOW}Checking cache reuse after reverting headers...${NC}"
+    cat > "$SRC/config.h.in" << 'EOF'
+#pragma once
+#define GENERATED_VALUE 42
+EOF
+    cat > "$SRC/extra.h" << 'EOF'
+#pragma once
+#define EXTRA_VALUE 1
+EOF
+    revert_output=$(run_rninja 2>&1)
+    check_app 43
+    if [[ "$revert_output" != *"(cached)"* ]]; then
+        echo -e "${RED}FAIL: expected a cache hit after reverting headers${NC}"
+        echo "$revert_output"
+        exit 1
+    fi
 else
     echo -e "${YELLOW}SKIP: compiler does not produce depfiles${NC}"
 fi
