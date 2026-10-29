@@ -10,11 +10,17 @@ use console::{truncate_str, Term};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Minimum time between automatic lifecycle redraws. Forcing a redraw (command
 /// output or an error) is not throttled.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often running-task timers are repainted. Lifecycle events still redraw
+/// immediately (subject to [`REFRESH_INTERVAL`]); this is only needed so elapsed
+/// times keep advancing while a long task runs.
+const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How progress should be displayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -75,7 +81,6 @@ impl Glyphs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineKind {
     Branch,
-    Pending,
     Running,
     Failed,
 }
@@ -96,6 +101,7 @@ struct ProgressNode {
     completed: usize,
     active: bool,
     running: bool,
+    started_at: Option<Instant>,
     failed: bool,
 }
 
@@ -123,6 +129,7 @@ impl ProgressTree {
             completed: 0,
             active: true,
             running: false,
+            started_at: None,
             failed: false,
         }];
         let mut index_by_path = HashMap::new();
@@ -173,6 +180,7 @@ impl ProgressTree {
         if let Some(index) = self.find(path) {
             if self.nodes[index].active {
                 self.nodes[index].running = true;
+                self.nodes[index].started_at = Some(Instant::now());
             }
         }
     }
@@ -190,6 +198,7 @@ impl ProgressTree {
             self.complete(index);
         } else {
             self.nodes[index].running = false;
+            self.nodes[index].started_at = None;
             self.nodes[index].failed = true;
         }
     }
@@ -206,6 +215,7 @@ impl ProgressTree {
         }
 
         self.nodes[index].running = false;
+        self.nodes[index].started_at = None;
         self.nodes[index].active = false;
         self.nodes[index].completed = self.nodes[index].total;
 
@@ -229,17 +239,30 @@ impl ProgressTree {
     }
 
     fn render_lines(&self, width: usize, max_lines: usize, glyphs: Glyphs) -> Vec<ProgressLine> {
-        let visible = self.visible_count(self.root);
-        let truncated = visible > max_lines;
+        self.render_lines_at(width, max_lines, glyphs, Instant::now())
+    }
+
+    fn render_lines_at(
+        &self,
+        width: usize,
+        max_lines: usize,
+        glyphs: Glyphs,
+        now: Instant,
+    ) -> Vec<ProgressLine> {
+        let visible = self.visibility();
+        let total_visible = self.visible_count(&visible, self.root);
+        let truncated = total_visible > max_lines;
         let limit = if truncated {
             max_lines.saturating_sub(1).max(1)
         } else {
             max_lines
         };
 
-        let mut lines = Vec::with_capacity(visible.min(max_lines));
+        let mut lines = Vec::with_capacity(total_visible.min(max_lines));
         if limit > 0 {
-            self.render_node(self.root, "", None, limit, glyphs, &mut lines);
+            self.render_node(
+                self.root, "", None, limit, glyphs, now, &visible, &mut lines,
+            );
         }
 
         if truncated && lines.len() < max_lines {
@@ -258,18 +281,46 @@ impl ProgressTree {
         lines
     }
 
-    fn visible_count(&self, index: usize) -> usize {
-        if !self.nodes[index].active {
+    /// Compute which nodes should appear in the live tree. Queued work is
+    /// culled; only running or failed tasks and their ancestors remain visible.
+    fn visibility(&self) -> Vec<bool> {
+        let mut visible = vec![false; self.nodes.len()];
+        self.mark_visible(self.root, &mut visible);
+        visible[self.root] = true;
+        visible
+    }
+
+    fn mark_visible(&self, index: usize, visible: &mut [bool]) -> bool {
+        let node = &self.nodes[index];
+        if !node.active {
+            return false;
+        }
+
+        let mut live = node.running || node.failed;
+        for &child in &node.children {
+            live |= self.mark_visible(child, visible);
+        }
+        visible[index] = live;
+        live
+    }
+
+    fn has_running(&self) -> bool {
+        self.nodes.iter().any(|node| node.active && node.running)
+    }
+
+    fn visible_count(&self, visible: &[bool], index: usize) -> usize {
+        if !visible[index] {
             return 0;
         }
 
         let mut count = 1;
         for child in &self.nodes[index].children {
-            count += self.visible_count(*child);
+            count += self.visible_count(visible, *child);
         }
         count
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_node(
         &self,
         index: usize,
@@ -277,6 +328,8 @@ impl ProgressTree {
         connector: Option<&str>,
         limit: usize,
         glyphs: Glyphs,
+        now: Instant,
+        visible: &[bool],
         lines: &mut Vec<ProgressLine>,
     ) {
         if lines.len() >= limit {
@@ -284,7 +337,7 @@ impl ProgressTree {
         }
 
         let node = &self.nodes[index];
-        if !node.active {
+        if !visible[index] {
             return;
         }
 
@@ -295,15 +348,23 @@ impl ProgressTree {
         }
         text.push_str(&format!(
             "[{}/{}] {}",
-            node.completed, node.total, node.name
+            node.completed,
+            node.total,
+            node.name.trim_end()
         ));
+        if let Some(started_at) = node.started_at {
+            let elapsed = now.saturating_duration_since(started_at);
+            // Avoid adding a noisy "(0ms)" to every task as it starts; the
+            // timer becomes useful once a task has been running for a while.
+            if elapsed >= Duration::from_secs(1) {
+                text.push_str(&format!(" ({})", format_elapsed(elapsed)));
+            }
+        }
 
         let kind = if node.failed {
             LineKind::Failed
         } else if node.running {
             LineKind::Running
-        } else if node.is_task {
-            LineKind::Pending
         } else {
             LineKind::Branch
         };
@@ -313,7 +374,7 @@ impl ProgressTree {
             .children
             .iter()
             .copied()
-            .filter(|child| self.nodes[*child].active)
+            .filter(|child| visible[*child])
             .collect();
 
         let child_prefix = if index == self.root {
@@ -333,7 +394,16 @@ impl ProgressTree {
             } else {
                 glyphs.tee()
             };
-            self.render_node(*child, &child_prefix, Some(connector), limit, glyphs, lines);
+            self.render_node(
+                *child,
+                &child_prefix,
+                Some(connector),
+                limit,
+                glyphs,
+                now,
+                visible,
+                lines,
+            );
         }
     }
 }
@@ -377,6 +447,7 @@ fn add_node(
         completed: 0,
         active: true,
         running: false,
+        started_at: None,
         failed: false,
     });
     index_by_path.insert(path.to_string(), index);
@@ -403,6 +474,20 @@ fn compute_totals(nodes: &mut [ProgressNode], index: usize) -> usize {
     }
     nodes[index].total = total;
     total
+}
+
+/// Format a running task's elapsed time compactly.
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 1 {
+        format!("{}ms", elapsed.as_millis())
+    } else if secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 /// Write a captured stream, ensuring it ends on a fresh line so the tree can
@@ -458,10 +543,40 @@ impl TreeProgress {
         }))
     }
 
-    /// Draw the initial tree before the first task starts.
-    pub fn start(&self) {
+    /// Draw the initial tree before the first task starts, then keep elapsed
+    /// times advancing while tasks are running.
+    pub fn start(self: &Arc<Self>) {
+        {
+            let mut state = self.inner.lock().unwrap();
+            self.render(&mut state);
+        }
+
+        // The ticker holds only a weak reference, so it cannot keep the
+        // renderer alive after the build finishes or is dropped.
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || loop {
+            thread::sleep(TIMER_INTERVAL);
+            match weak.upgrade() {
+                Some(tree) => {
+                    if tree.tick() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        });
+    }
+
+    /// Repaint running timers. Returns true once the tree has finished.
+    fn tick(&self) -> bool {
         let mut state = self.inner.lock().unwrap();
-        self.render(&mut state);
+        if state.finished {
+            return true;
+        }
+        if state.tree.has_running() {
+            self.render(&mut state);
+        }
+        false
     }
 
     pub fn task_started(&self, path: &str) {
@@ -617,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_dependency_tree_with_branch_counts() {
+    fn renders_only_live_work_and_branch_counts() {
         let mut tree = tree_for(
             r#"
 rule cc
@@ -636,18 +751,13 @@ build all: phony app
             &["obj1", "obj2", "app"],
         );
 
-        assert_eq!(
-            lines(&tree),
-            vec![
-                "[0/3] build",
-                "`- [0/3] all",
-                "   `- [0/3] LINK app",
-                "      |- [0/1] CC obj1",
-                "      `- [0/1] CC obj2",
-            ]
-        );
+        // Nothing is executing yet, so all queued work is culled.
+        assert_eq!(lines(&tree), vec!["[0/3] build"]);
 
         tree.cache_hit("obj1");
+        assert_eq!(lines(&tree), vec!["[1/3] build"]);
+
+        tree.task_started("obj2");
         assert_eq!(
             lines(&tree),
             vec![
@@ -658,16 +768,40 @@ build all: phony app
             ]
         );
 
-        tree.task_started("obj2");
         tree.task_finished("obj2", true);
+        assert_eq!(lines(&tree), vec!["[2/3] build"]);
+
+        tree.task_started("app");
         assert_eq!(
             lines(&tree),
             vec!["[2/3] build", "`- [2/3] all", "   `- [2/3] LINK app",]
         );
 
-        tree.task_started("app");
         tree.task_finished("app", true);
         assert_eq!(lines(&tree), vec!["[3/3] build"]);
+    }
+
+    #[test]
+    fn culls_pending_siblings() {
+        let mut tree = tree_for(
+            r#"
+rule cc
+    command = cc $in -o $out
+    description = CC $out
+
+build a: cc a.c
+build b: cc b.c
+build all: phony a b
+"#,
+            &["all"],
+            &["a", "b"],
+        );
+
+        tree.task_started("a");
+        assert_eq!(
+            lines(&tree),
+            vec!["[0/2] build", "`- [0/2] all", "   `- [0/1] CC a",]
+        );
     }
 
     #[test]
@@ -687,18 +821,20 @@ build all: phony a b
             &["shared", "a", "b"],
         );
 
+        tree.task_started("shared");
         assert_eq!(
             lines(&tree),
             vec![
                 "[0/3] build",
                 "`- [0/3] all",
-                "   |- [0/2] CC a",
-                "   |  `- [0/1] CC shared",
-                "   `- [0/1] CC b",
+                "   `- [0/2] CC a",
+                "      `- [0/1] CC shared",
             ]
         );
 
-        tree.cache_hit("shared");
+        tree.task_finished("shared", true);
+        tree.task_started("a");
+        tree.task_started("b");
         assert_eq!(
             lines(&tree),
             vec![
@@ -711,8 +847,8 @@ build all: phony a b
     }
 
     #[test]
-    fn truncates_tall_trees() {
-        let tree = tree_for(
+    fn truncates_tall_running_trees() {
+        let mut tree = tree_for(
             r#"
 rule cc
     command = cc $in -o $out
@@ -727,11 +863,51 @@ build all: phony a b c
             &["a", "b", "c"],
         );
 
+        tree.task_started("a");
+        tree.task_started("b");
+        tree.task_started("c");
+
         let lines = tree.render_lines(100, 3, Glyphs::Ascii);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "[0/3] build");
         assert_eq!(lines[1].text, "`- [0/3] all");
         assert_eq!(lines[2].text, "   ... more");
+    }
+
+    #[test]
+    fn shows_elapsed_time_for_running_tasks() {
+        let mut tree = tree_for(
+            r#"
+rule cc
+    command = cc $in -o $out
+    description = CC $out
+
+build a: cc a.c
+build all: phony a
+"#,
+            &["all"],
+            &["a"],
+        );
+
+        let base = Instant::now();
+        tree.task_started("a");
+        let index = tree.find("a").unwrap();
+        tree.nodes[index].started_at = Some(base);
+
+        let rendered =
+            tree.render_lines_at(100, 100, Glyphs::Ascii, base + Duration::from_millis(1500));
+        assert_eq!(rendered.last().unwrap().text, "   `- [0/1] CC a (1.5s)");
+    }
+
+    #[test]
+    fn formats_elapsed_times_compactly() {
+        assert_eq!(format_elapsed(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_elapsed(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1000)), "1.0s");
+        assert_eq!(format_elapsed(Duration::from_millis(12_340)), "12.3s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m05s");
+        assert_eq!(format_elapsed(Duration::from_secs(3723)), "1h02m");
     }
 
     #[test]
