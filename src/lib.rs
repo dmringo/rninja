@@ -4,6 +4,7 @@
 //! including local and remote caching, parallel execution, and Ninja compatibility.
 
 pub mod admin;
+pub mod buildlock;
 pub mod buildlog;
 pub mod cache;
 pub mod cli;

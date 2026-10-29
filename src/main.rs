@@ -5,6 +5,7 @@
 #![allow(unused_imports)]
 
 mod admin;
+mod buildlock;
 mod buildlog;
 mod cache;
 mod cli;
@@ -52,6 +53,16 @@ fn run_build(cli: &Cli) -> Result<()> {
         std::path::Path::new(dir)
     } else {
         std::path::Path::new(".")
+    };
+
+    // Serialize rninja builds sharing this directory. Ninja does not honor
+    // this lock, so concurrent Ninja/rninja builds are still unsafe.
+    let _build_lock = match buildlock::BuildLock::acquire(std::path::Path::new(".")) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!("another rninja build is already running in this directory");
+        }
+        Err(error) => return Err(error.into()),
     };
 
     // Parse the build file

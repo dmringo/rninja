@@ -290,6 +290,11 @@ rninja [OPTIONS] [TARGETS...]
 | `-f FILE` | | Use FILE as build file |
 | `-C DIR` | | Change to DIR before building |
 
+Only one rninja build can run per build directory. rninja holds
+`.rninja_lock` for the duration and rejects a second invocation. The lock is
+not understood by upstream Ninja, so do not run Ninja and rninja concurrently
+against the same build directory.
+
 `-k` stops launching new jobs once the failure limit is reached, but jobs that
 are already running are allowed to finish. Up to `-j` failures can therefore be
 reported at once.
