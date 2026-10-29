@@ -46,6 +46,7 @@ chmod +x "$SCRIPT_DIR"/*.sh
 run_test "CMake" "$SCRIPT_DIR/cmake_test.sh"
 run_test "CMake Multi-Config" "$SCRIPT_DIR/cmake_multiconfig_test.sh"
 run_test "CMake Generated Header" "$SCRIPT_DIR/cmake_generated_header_test.sh"
+run_test "Ninja NOP Compatibility" "$SCRIPT_DIR/ninja_nop_compat_test.sh"
 run_test "Meson" "$SCRIPT_DIR/meson_test.sh"
 run_test "GN" "$SCRIPT_DIR/gn_test.sh"
 
