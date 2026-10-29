@@ -46,6 +46,16 @@ fn main() -> Result<()> {
     run_build(&cli)
 }
 
+fn acquire_build_lock() -> Result<buildlock::BuildLock> {
+    match buildlock::BuildLock::acquire(std::path::Path::new(".")) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!("another rninja build is already running in this directory");
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn run_build(cli: &Cli) -> Result<()> {
     // Change to build directory if specified
     let build_dir = if let Some(dir) = &cli.dir {
@@ -57,13 +67,7 @@ fn run_build(cli: &Cli) -> Result<()> {
 
     // Serialize rninja builds sharing this directory. Ninja does not honor
     // this lock, so concurrent Ninja/rninja builds are still unsafe.
-    let _build_lock = match buildlock::BuildLock::acquire(std::path::Path::new(".")) {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            anyhow::bail!("another rninja build is already running in this directory");
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let _build_lock = acquire_build_lock()?;
 
     // Parse the build file
     let build_file = cli.file.as_deref().unwrap_or("build.ninja");
@@ -181,6 +185,7 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             if let Some(dir) = &cli.dir {
                 std::env::set_current_dir(dir)?;
             }
+            let _lock = acquire_build_lock()?;
             let build_file = cli.file.as_deref().unwrap_or("build.ninja");
             let manifest = parser::parse_file(std::path::Path::new(build_file))?;
             let graph = graph::Graph::from_manifest(&manifest)?;
@@ -390,6 +395,7 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             if let Some(dir) = &cli.dir {
                 std::env::set_current_dir(dir)?;
             }
+            let _lock = acquire_build_lock()?;
             let build_file = cli.file.as_deref().unwrap_or("build.ninja");
             let manifest = parser::parse_file(std::path::Path::new(build_file))?;
             let graph = graph::Graph::from_manifest(&manifest)?;
@@ -422,6 +428,7 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             if let Some(dir) = &cli.dir {
                 std::env::set_current_dir(dir)?;
             }
+            let _lock = acquire_build_lock()?;
             let build_file = cli.file.as_deref().unwrap_or("build.ninja");
             let manifest = parser::parse_file(std::path::Path::new(build_file))?;
             let graph = graph::Graph::from_manifest(&manifest)?;
@@ -456,6 +463,7 @@ fn run_tool(tool: &str, cli: &Cli) -> Result<()> {
             if let Some(dir) = &cli.dir {
                 std::env::set_current_dir(dir)?;
             }
+            let _lock = acquire_build_lock()?;
             let cwd = std::env::current_dir()?;
 
             // Recompact .ninja_log by reloading and saving
