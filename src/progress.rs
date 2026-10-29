@@ -272,9 +272,13 @@ impl ProgressTree {
             });
         }
 
+        // Leave the last terminal column unused. Writing a full-width line
+        // triggers auto-wrap on many terminals, which shifts every subsequent
+        // cursor-relative operation by a line.
+        let line_width = width.saturating_sub(1);
         for line in &mut lines {
-            if width > 0 {
-                line.text = truncate_str(&line.text, width, glyphs.ellipsis()).into_owned();
+            if line_width > 0 {
+                line.text = truncate_str(&line.text, line_width, glyphs.ellipsis()).into_owned();
             }
         }
 
@@ -514,6 +518,132 @@ struct RenderState {
     finished: bool,
 }
 
+/// The subset of terminal operations used by the tree renderer. A small trait
+/// lets the repaint logic run against a virtual screen in tests.
+trait TerminalOps {
+    fn size(&self) -> (u16, u16);
+    fn write_str(&self, s: &str) -> io::Result<()>;
+    fn write_line(&self, s: &str) -> io::Result<()>;
+    fn move_cursor_up(&self, n: usize) -> io::Result<()>;
+    fn move_cursor_down(&self, n: usize) -> io::Result<()>;
+    fn move_cursor_left(&self, n: usize) -> io::Result<()>;
+    fn flush(&self) -> io::Result<()>;
+}
+
+impl TerminalOps for Term {
+    fn size(&self) -> (u16, u16) {
+        Term::size(self)
+    }
+
+    fn write_str(&self, s: &str) -> io::Result<()> {
+        Term::write_str(self, s)
+    }
+
+    fn write_line(&self, s: &str) -> io::Result<()> {
+        Term::write_line(self, s)
+    }
+
+    fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+        Term::move_cursor_up(self, n)
+    }
+
+    fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+        Term::move_cursor_down(self, n)
+    }
+
+    fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+        Term::move_cursor_left(self, n)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        Term::flush(self)
+    }
+}
+
+/// Repaint only the lines that changed. The cursor starts just below the tree;
+/// walk back to the first line, then overwrite changed lines in place.
+fn redraw_terminal(term: &impl TerminalOps, old: &[String], new: &[String]) {
+    let (_, cols) = term.size();
+    let width = if cols == 0 { 80 } else { cols as usize };
+
+    // Start from the beginning of the line below the tree. The cursor may not
+    // be at column zero after a previous partial repaint.
+    let _ = term.move_cursor_left(width);
+
+    if old.is_empty() {
+        for line in new {
+            let _ = term.write_line(line);
+        }
+        return;
+    }
+
+    let _ = term.move_cursor_up(old.len());
+
+    let common = old.len().min(new.len());
+    for index in 0..common {
+        let _ = term.move_cursor_left(width);
+
+        if old[index] == new[index] {
+            let _ = term.move_cursor_down(1);
+            continue;
+        }
+
+        let old_width = measure_text_width(&old[index]);
+        let new_width = measure_text_width(&new[index]);
+        let _ = term.write_str(&new[index]);
+        if new_width < old_width {
+            let padding = " ".repeat(old_width - new_width);
+            let _ = term.write_str(&padding);
+        }
+        let _ = term.move_cursor_down(1);
+    }
+
+    if new.len() > old.len() {
+        for line in &new[old.len()..] {
+            let _ = term.move_cursor_left(width);
+            let _ = term.write_line(line);
+        }
+    } else if old.len() > new.len() {
+        let extra = old.len() - new.len();
+        for line in &old[new.len()..] {
+            let _ = term.move_cursor_left(width);
+            let line_width = measure_text_width(line);
+            if line_width > 0 {
+                let _ = term.write_str(&" ".repeat(line_width));
+            }
+            let _ = term.move_cursor_down(1);
+        }
+        let _ = term.move_cursor_up(extra);
+    }
+}
+
+/// Erase the previously rendered tree and leave the cursor at its start.
+fn clear_terminal(term: &impl TerminalOps, old: &mut Vec<String>) {
+    if old.is_empty() {
+        return;
+    }
+
+    let (_, cols) = term.size();
+    let width = if cols == 0 { 80 } else { cols as usize };
+
+    let _ = term.move_cursor_left(width);
+    let _ = term.move_cursor_up(old.len());
+
+    for line in old.iter() {
+        let _ = term.move_cursor_left(width);
+        let line_width = measure_text_width(line);
+        if line_width > 0 {
+            let _ = term.write_str(&" ".repeat(line_width));
+        }
+        let _ = term.move_cursor_down(1);
+    }
+
+    let _ = term.move_cursor_up(old.len());
+    let _ = term.move_cursor_left(width);
+    old.clear();
+    let _ = term.flush();
+}
+
 /// Thread-safe live tree renderer.
 pub struct TreeProgress {
     inner: Mutex<RenderState>,
@@ -705,85 +835,11 @@ impl TreeProgress {
     /// lone `\r` in `clear_line` is translated to a newline by some Windows
     /// ptys (notably MSYS), which would shift the whole tree.
     fn redraw(&self, state: &RenderState, new: &[String]) {
-        let (_, cols) = self.term.size();
-        let width = if cols == 0 { 80 } else { cols as usize };
-
-        // Start from the beginning of the line below the tree. The cursor may
-        // not be at column zero after a previous partial repaint.
-        let _ = self.term.move_cursor_left(width);
-
-        let old = &state.last_rendered;
-        if old.is_empty() {
-            for line in new {
-                let _ = self.term.write_line(line);
-            }
-            return;
-        }
-
-        let _ = self.term.move_cursor_up(old.len());
-
-        let common = old.len().min(new.len());
-        for index in 0..common {
-            let _ = self.term.move_cursor_left(width);
-
-            if old[index] == new[index] {
-                let _ = self.term.move_cursor_down(1);
-                continue;
-            }
-
-            let old_width = measure_text_width(&old[index]);
-            let new_width = measure_text_width(&new[index]);
-            let _ = self.term.write_str(&new[index]);
-            if new_width < old_width {
-                let padding = " ".repeat(old_width - new_width);
-                let _ = self.term.write_str(&padding);
-            }
-            let _ = self.term.move_cursor_down(1);
-        }
-
-        if new.len() > old.len() {
-            for line in &new[old.len()..] {
-                let _ = self.term.move_cursor_left(width);
-                let _ = self.term.write_line(line);
-            }
-        } else if old.len() > new.len() {
-            let extra = old.len() - new.len();
-            for line in &old[new.len()..] {
-                let _ = self.term.move_cursor_left(width);
-                let line_width = measure_text_width(line);
-                if line_width > 0 {
-                    let _ = self.term.write_str(&" ".repeat(line_width));
-                }
-                let _ = self.term.move_cursor_down(1);
-            }
-            let _ = self.term.move_cursor_up(extra);
-        }
+        redraw_terminal(&self.term, &state.last_rendered, new);
     }
 
     fn clear(&self, state: &mut RenderState) {
-        if state.last_rendered.is_empty() {
-            return;
-        }
-
-        let (_, cols) = self.term.size();
-        let width = if cols == 0 { 80 } else { cols as usize };
-
-        let _ = self.term.move_cursor_left(width);
-        let _ = self.term.move_cursor_up(state.last_rendered.len());
-
-        for line in &state.last_rendered {
-            let _ = self.term.move_cursor_left(width);
-            let line_width = measure_text_width(line);
-            if line_width > 0 {
-                let _ = self.term.write_str(&" ".repeat(line_width));
-            }
-            let _ = self.term.move_cursor_down(1);
-        }
-
-        let _ = self.term.move_cursor_up(state.last_rendered.len());
-        let _ = self.term.move_cursor_left(width);
-        state.last_rendered.clear();
-        let _ = self.term.flush();
+        clear_terminal(&self.term, &mut state.last_rendered);
     }
 }
 
@@ -1006,5 +1062,251 @@ build all: phony a
         let mut buf = Vec::new();
         write_stream(&mut buf, b"");
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn rendered_lines_reserve_the_last_terminal_column() {
+        let tree = tree_for(
+            r#"
+rule cc
+    command = cc $in -o $out
+    description = CC $out
+
+build a_very_long_target_name_that_would_fill_the_terminal: cc source.c
+build all: phony a_very_long_target_name_that_would_fill_the_terminal
+"#,
+            &["all"],
+            &["a_very_long_target_name_that_would_fill_the_terminal"],
+        );
+
+        let lines = tree.render_lines(20, 100, Glyphs::Ascii);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(
+                measure_text_width(&line.text) < 20,
+                "line fills the terminal width: {:?}",
+                line.text
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct VirtualScreen {
+        rows: Vec<Vec<char>>,
+        x: usize,
+        y: usize,
+        pending_wrap: bool,
+    }
+
+    impl VirtualScreen {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                rows: vec![vec![' '; width]; height],
+                x: 0,
+                y: 0,
+                pending_wrap: false,
+            }
+        }
+
+        fn newline(&mut self, height: usize) {
+            self.x = 0;
+            self.y += 1;
+            self.pending_wrap = false;
+            self.scroll(height);
+        }
+
+        fn scroll(&mut self, height: usize) {
+            while self.y >= height {
+                self.rows.remove(0);
+                self.rows.push(vec![' '; self.rows[0].len()]);
+                self.y = height - 1;
+            }
+        }
+
+        fn write_str(&mut self, text: &str, height: usize) {
+            for ch in text.chars() {
+                if ch == '\n' {
+                    self.newline(height);
+                    continue;
+                }
+
+                if self.pending_wrap {
+                    self.x = 0;
+                    self.y += 1;
+                    self.pending_wrap = false;
+                    self.scroll(height);
+                }
+
+                let width = self.rows[0].len();
+                self.rows[self.y][self.x] = ch;
+                if self.x + 1 >= width {
+                    self.pending_wrap = true;
+                } else {
+                    self.x += 1;
+                }
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            let mut lines: Vec<String> = self
+                .rows
+                .iter()
+                .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                .collect();
+            while lines.last().is_some_and(|line| line.is_empty()) {
+                lines.pop();
+            }
+            lines
+        }
+    }
+
+    struct VirtualTerminal {
+        width: usize,
+        height: usize,
+        screen: std::cell::RefCell<VirtualScreen>,
+    }
+
+    impl VirtualTerminal {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                width,
+                height,
+                screen: std::cell::RefCell::new(VirtualScreen::new(width, height)),
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.screen.borrow().lines()
+        }
+
+        fn cursor(&self) -> (usize, usize) {
+            let screen = self.screen.borrow();
+            (screen.x, screen.y)
+        }
+    }
+
+    impl TerminalOps for VirtualTerminal {
+        fn size(&self) -> (u16, u16) {
+            // Term::size returns (rows, columns).
+            (self.height as u16, self.width as u16)
+        }
+
+        fn write_str(&self, s: &str) -> io::Result<()> {
+            self.screen.borrow_mut().write_str(s, self.height);
+            Ok(())
+        }
+
+        fn write_line(&self, s: &str) -> io::Result<()> {
+            let mut screen = self.screen.borrow_mut();
+            screen.write_str(s, self.height);
+            screen.newline(self.height);
+            Ok(())
+        }
+
+        fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+            let mut screen = self.screen.borrow_mut();
+            screen.y = screen.y.saturating_sub(n);
+            screen.pending_wrap = false;
+            Ok(())
+        }
+
+        fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+            let mut screen = self.screen.borrow_mut();
+            screen.y = (screen.y + n).min(self.height.saturating_sub(1));
+            screen.pending_wrap = false;
+            Ok(())
+        }
+
+        fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+            let mut screen = self.screen.borrow_mut();
+            screen.x = screen.x.saturating_sub(n);
+            screen.pending_wrap = false;
+            Ok(())
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn repaint_keeps_growing_and_shrinking_frames_aligned() {
+        let term = VirtualTerminal::new(40, 10);
+
+        let first = vec![
+            "[0/3] build".to_string(),
+            "`- [0/3] all".to_string(),
+            "   `- [0/3] LINK app".to_string(),
+        ];
+        redraw_terminal(&term, &[], &first);
+        assert_eq!(term.lines(), first);
+
+        let second = vec![
+            "[1/3] build".to_string(),
+            "`- [1/3] all".to_string(),
+            "   `- [1/3] LINK app (1.0s)".to_string(),
+            "      `- [0/1] CC obj".to_string(),
+        ];
+        redraw_terminal(&term, &first, &second);
+        assert_eq!(term.lines(), second);
+
+        // A shorter line must be padded so the old suffix disappears.
+        let shorter = vec![
+            "[1/3] build".to_string(),
+            "`- [1/3] all".to_string(),
+            "   `- [1/3] LINK app".to_string(),
+            "      `- [0/1] CC obj".to_string(),
+        ];
+        redraw_terminal(&term, &second, &shorter);
+        assert_eq!(term.lines(), shorter);
+
+        let third = vec!["[2/3] build".to_string(), "`- [2/3] all".to_string()];
+        redraw_terminal(&term, &shorter, &third);
+        assert_eq!(term.lines(), third);
+
+        let mut old = third.clone();
+        clear_terminal(&term, &mut old);
+        assert!(term.lines().is_empty());
+        assert!(old.is_empty());
+        assert_eq!(term.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn repaint_handles_long_lines_without_extra_blank_rows() {
+        let tree = tree_for(
+            r#"
+rule cc
+    command = cc $in -o $out
+    description = CC $out
+
+build a_very_long_target_name_that_would_fill_the_terminal: cc source.c
+build all: phony a_very_long_target_name_that_would_fill_the_terminal
+"#,
+            &["all"],
+            &["a_very_long_target_name_that_would_fill_the_terminal"],
+        );
+
+        let rendered: Vec<String> = tree
+            .render_lines(20, 100, Glyphs::Ascii)
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+
+        let term = VirtualTerminal::new(20, 10);
+        redraw_terminal(&term, &[], &rendered);
+        assert_eq!(term.lines(), rendered);
+
+        let updated: Vec<String> = rendered
+            .iter()
+            .map(|line| {
+                if line.starts_with("[0/1] build") {
+                    format!("{} (1.0s)", line)
+                } else {
+                    line.clone()
+                }
+            })
+            .collect();
+        redraw_terminal(&term, &rendered, &updated);
+        assert_eq!(term.lines(), updated);
     }
 }
