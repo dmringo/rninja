@@ -850,7 +850,8 @@ impl Executor {
                     state.record_build(&path, command_hash, 0, 0);
                     if !depfile.is_empty() {
                         if let Ok(parsed) = depfile::parse(&depfile) {
-                            let deps: Vec<String> = parsed.deps.into_iter().collect();
+                            let mut deps: Vec<String> = parsed.deps.into_iter().collect();
+                            deps.sort();
                             state.record_deps(&path, &deps);
                         } else {
                             state.refresh_deps_mtime(&path);
@@ -1418,7 +1419,8 @@ async fn execute_node_async(
     if !depfile.is_empty() {
         if let Ok(parsed) = depfile::parse(depfile) {
             if success {
-                let deps: Vec<String> = parsed.deps.into_iter().collect();
+                let mut deps: Vec<String> = parsed.deps.into_iter().collect();
+                deps.sort();
                 state.record_deps(path, &deps);
             } else {
                 debug!("Parsed depfile {}: {:?}", depfile, parsed.deps);
