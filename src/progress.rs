@@ -135,18 +135,7 @@ impl ProgressTree {
         let mut index_by_path = HashMap::new();
 
         for target in targets {
-            if let Some((index, created)) = add_node(
-                target,
-                Some(0),
-                graph,
-                scheduled,
-                &mut nodes,
-                &mut index_by_path,
-            ) {
-                if created {
-                    nodes[0].children.push(index);
-                }
-            }
+            add_dependency(target, 0, graph, scheduled, &mut nodes, &mut index_by_path);
         }
 
         if nodes[0].children.is_empty() {
@@ -458,16 +447,47 @@ fn add_node(
 
     let deps = graph_node.deps.clone();
     for dep in deps {
-        if let Some((child, created)) =
-            add_node(&dep, Some(index), graph, scheduled, nodes, index_by_path)
-        {
-            if created {
-                nodes[index].children.push(child);
-            }
-        }
+        add_dependency(&dep, index, graph, scheduled, nodes, index_by_path);
     }
 
     Some((index, true))
+}
+
+/// CMake emits synthetic phony barriers named
+/// `cmake_object_order_depends_target_*` to encode target-level ordering.
+/// They carry no user-visible work, so splice their real dependencies into
+/// the parent instead of drawing a misleading branch.
+fn is_cmake_order_dep(path: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .starts_with("cmake_object_order_depends_")
+}
+
+fn add_dependency(
+    path: &str,
+    parent: usize,
+    graph: &Graph,
+    scheduled: &HashSet<String>,
+    nodes: &mut Vec<ProgressNode>,
+    index_by_path: &mut HashMap<String, usize>,
+) {
+    if is_cmake_order_dep(path) {
+        if let Some(node) = graph.get_node(path) {
+            for dep in &node.deps {
+                add_dependency(dep, parent, graph, scheduled, nodes, index_by_path);
+            }
+        }
+        return;
+    }
+
+    if let Some((child, created)) =
+        add_node(path, Some(parent), graph, scheduled, nodes, index_by_path)
+    {
+        if created {
+            nodes[parent].children.push(child);
+        }
+    }
 }
 
 fn compute_totals(nodes: &mut [ProgressNode], index: usize) -> usize {
@@ -941,6 +961,42 @@ build all: phony a b
             lines(&tree),
             vec!["[0/2] build", "`- [0/2] all", "   `- [0/1] CC a",]
         );
+    }
+
+    #[test]
+    fn elides_cmake_order_only_barriers() {
+        let mut tree = tree_for(
+            r#"
+rule cc
+    command = cc -c $in -o $out
+    description = CC $out
+rule gen
+    command = gen $out
+    description = GEN $out
+
+build generated.h: gen
+build cmake_object_order_depends_target_app: phony || generated.h
+build obj.o: cc main.c || cmake_object_order_depends_target_app
+build app: phony obj.o
+"#,
+            &["app"],
+            &["generated.h", "obj.o"],
+        );
+
+        tree.task_started("generated.h");
+        let rendered = lines(&tree);
+
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("cmake_object_order_depends")),
+            "synthetic CMake barrier leaked into the tree: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("GEN generated.h")),
+            "generated header should remain visible: {rendered:?}"
+        );
+        assert_eq!(rendered[0], "[0/2] build");
     }
 
     #[test]
