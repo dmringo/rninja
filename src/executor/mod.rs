@@ -1324,6 +1324,13 @@ async fn spawn_command(
         cmd
     };
 
+    // Capture both streams so the executor can apply its success/failure
+    // output policy. Without this, children inherit rninja's terminal and
+    // successful stderr would leak through even in tree mode.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
     // If the executor aborts this task (for example, with
     // --kill-on-failure), dropping the future terminates the direct child.
     cmd.kill_on_drop(true);
@@ -1449,6 +1456,37 @@ mod tests {
         assert!(
             cache_key_for("cc", &deps, depfile, &[]).is_none(),
             "missing depfile inputs must disable the cache"
+        );
+    }
+
+    #[test]
+    fn test_spawn_command_captures_stdout_and_stderr() {
+        let state = BuildState::new(
+            1,
+            1,
+            &HashMap::new(),
+            OutputMode::Human,
+            None,
+            Arc::new(BuildTrace::new(false)),
+        );
+
+        #[cfg(windows)]
+        let command = "cmd /C \"echo stdout-value & echo stderr-value 1>&2\"";
+        #[cfg(not(windows))]
+        let command = "echo stdout-value; echo stderr-value 1>&2";
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let output = runtime
+            .block_on(spawn_command(command, "test", &state))
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "stdout-value"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "stderr-value"
         );
     }
 
