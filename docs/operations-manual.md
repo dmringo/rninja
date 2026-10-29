@@ -273,19 +273,40 @@ rninja [OPTIONS] [TARGETS...]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--version` | `-v` | Print version |
+| `--version` | `-V` | Print version |
 | `--help` | `-h` | Print help |
-| `--verbose` | | Verbose output |
+| `--verbose` | `-v` | Verbose output |
 | `--quiet` | | Suppress output |
 | `--jobs N` | `-j N` | Parallel jobs (0=auto) |
 | `--keep-going` | `-k` | Continue on errors |
 | `--dry-run` | `-n` | Don't execute commands |
 | `--explain` | | Explain why targets rebuild |
+| `--progress MODE` | | Progress display: `plain` (default) or `tree` (live dependency tree; interactive terminals only) |
 | `--tool NAME` | `-t NAME` | Run subtool |
 | `--no-daemon` | | Single-shot mode |
 | `--daemon-socket PATH` | | Custom daemon socket |
 | `-f FILE` | | Use FILE as build file |
 | `-C DIR` | | Change to DIR before building |
+
+To watch the live tree against a generated nested graph (requires a terminal):
+
+```bash
+tests/manual/progress_tree_demo.sh
+```
+
+The tree is transient and is replaced at the end by a summary such as
+`ninja: finished 9 tasks` (with a cache count when applicable).
+
+Task output is buffered while the tree is drawn and shown only when a task
+fails. Pass `--verbose` to also show output from successful tasks and print
+each full command line above the tree (the tree keeps using descriptions).
+To exercise both paths manually:
+
+```bash
+tests/manual/progress_tree_demo.sh                  # clean success
+DEMO_NOISY=1 tests/manual/progress_tree_demo.sh -v  # commands + successful output
+DEMO_FAIL=1 tests/manual/progress_tree_demo.sh      # failed-task output
+```
 
 ### Subtools (`-t`)
 
