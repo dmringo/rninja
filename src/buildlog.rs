@@ -55,11 +55,19 @@ impl BuildLog {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
-        // Check version header
+        // Match Ninja's policy: only the current version is understood.
+        // Older rninja logs (v5, decimal hashes) and future formats are
+        // ignored rather than misparsed. The log is disposable; a later
+        // build rewrites it in the current format.
         if let Some(Ok(header)) = lines.next() {
-            if !header.starts_with("# ninja log v") {
-                return; // Incompatible version
+            let version = header
+                .strip_prefix("# ninja log v")
+                .and_then(|value| value.trim().parse::<u32>().ok());
+            if version != Some(7) {
+                return;
             }
+        } else {
+            return;
         }
 
         for line in lines {
@@ -664,6 +672,20 @@ mod tests {
             let log = BuildLog::open(dir.path());
             assert_eq!(log.get_command_hash("output.o"), Some(12345));
         }
+    }
+
+    #[test]
+    fn ignores_old_build_log_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".ninja_log"),
+            "# ninja log v5\n0\t1\t2\tout.o\t3039\n",
+        )
+        .unwrap();
+
+        let log = BuildLog::open(dir.path());
+        assert!(log.get_command_hash("out.o").is_none());
+        assert!(log.get_mtime("out.o").is_none());
     }
 
     #[test]
