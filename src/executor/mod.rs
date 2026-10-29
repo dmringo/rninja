@@ -52,7 +52,7 @@ pub struct Config {
     pub dry_run: bool,
     /// Verbose mode (print all commands)
     pub verbose: bool,
-    /// Keep going after failures (0 = infinite)
+    /// Maximum number of failed jobs before stopping (0 = unlimited)
     pub keep_going: usize,
     /// Explain why targets are rebuilt
     pub explain: bool,
@@ -173,9 +173,9 @@ impl NodeState {
             | (NodeState::Pending, NodeState::Completed)
             | (NodeState::Pending, NodeState::Cancelled) => Ok(new),
             // From Ready
-            (NodeState::Ready, NodeState::Running) | (NodeState::Ready, NodeState::Cancelled) => {
-                Ok(new)
-            }
+            (NodeState::Ready, NodeState::Running)
+            | (NodeState::Ready, NodeState::Failed)
+            | (NodeState::Ready, NodeState::Cancelled) => Ok(new),
             // From Running
             (NodeState::Running, NodeState::Completed)
             | (NodeState::Running, NodeState::Failed)
@@ -281,6 +281,13 @@ impl BuildState {
 
     fn mark_cancelled(&self, path: &str) {
         self.apply_transition(path, NodeState::Cancelled);
+    }
+
+    /// Whether the configured failure limit has been reached. `0` means no
+    /// limit. Checked both when scheduling new work and by already-spawned
+    /// tasks before they start executing.
+    fn should_stop(&self, keep_going: usize) -> bool {
+        keep_going > 0 && self.fail_count.load(Ordering::SeqCst) >= keep_going
     }
 
     fn report_task_started(&self, path: &str) {
@@ -571,8 +578,7 @@ impl Executor {
 
         while !pending.is_empty() || !handles.is_empty() {
             // Check if we should stop due to failures
-            let fail_count = state.fail_count.load(Ordering::SeqCst);
-            if self.config.keep_going > 0 && fail_count >= self.config.keep_going {
+            if state.should_stop(self.config.keep_going) {
                 // Cancel remaining pending work
                 for node in &pending {
                     state.mark_cancelled(&node.path);
@@ -586,8 +592,10 @@ impl Executor {
 
             for node in pending {
                 if state.has_failed_dep(&node.deps) {
-                    // Skip nodes with failed dependencies
-                    state.mark_failed(&node.path);
+                    // Skip nodes with failed dependencies. This is a
+                    // cancellation, not a command failure, so it must not
+                    // consume the keep-going budget.
+                    state.mark_cancelled(&node.path);
                     continue;
                 }
 
@@ -708,6 +716,16 @@ impl Executor {
                             ));
                         }
                     };
+
+                    // This task was spawned when its dependencies became
+                    // ready, but it may have waited behind other jobs long
+                    // enough for the failure limit to be reached. Do not start
+                    // it in that case; it never executed, so it is cancelled
+                    // rather than failed.
+                    if state.should_stop(config.keep_going) {
+                        state.mark_cancelled(&path);
+                        return Ok((path, false, None));
+                    }
 
                     state.mark_running(&path);
                     state.report_task_started(&path);
@@ -1103,6 +1121,27 @@ mod tests {
     #[test]
     fn test_completed_node_cannot_run_again() {
         assert!(NodeState::Completed.transition(NodeState::Running).is_err());
+    }
+
+    #[test]
+    fn test_skipped_node_is_cancelled_not_failed() {
+        // Nodes skipped because a dependency failed never ran a command, so
+        // they must not consume the keep-going failure budget.
+        assert_eq!(
+            NodeState::Pending.transition(NodeState::Cancelled).unwrap(),
+            NodeState::Cancelled
+        );
+        assert!(NodeState::Pending.transition(NodeState::Failed).is_err());
+    }
+
+    #[test]
+    fn test_ready_node_can_fail_when_scheduling_fails() {
+        // A spawned task can fail before it starts (for example, if the
+        // semaphore is closed), so Ready -> Failed is a valid fatal path.
+        assert_eq!(
+            NodeState::Ready.transition(NodeState::Failed).unwrap(),
+            NodeState::Failed
+        );
     }
 
     #[test]
