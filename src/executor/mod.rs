@@ -652,24 +652,21 @@ impl Executor {
 
                 // Collect environment variables that affect the build
                 let env_vars = collect_relevant_env_vars();
-                let env_refs: Vec<(&str, &str)> =
-                    env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-                // Compute cache key
-                let cache_key = if let (Some(cache), Some(cmd)) = (&self.cache, &command) {
-                    if !is_phony {
-                        let input_paths: Vec<_> =
-                            deps.iter().map(|d| Path::new(d.as_str())).collect();
-                        match cache.action_key(cmd, &input_paths, &env_refs) {
-                            Ok(key) => Some(key),
-                            Err(e) => {
-                                tracing::warn!("Failed to compute cache key: {}", e);
-                                None
-                            }
+                // Compute cache key. Depfile-discovered headers are part of
+                // the action inputs; without them a header change could
+                // restore a stale object from the cache.
+                let cache_key = if self.cache.is_some() && !is_phony {
+                    command.as_deref().and_then(|cmd| {
+                        let key = cache_key_for(cmd, &deps, &depfile, &env_vars);
+                        if key.is_none() {
+                            debug!(
+                                "Skipping cache lookup for {}: depfile dependencies unavailable",
+                                path
+                            );
                         }
-                    } else {
-                        None
-                    }
+                        key
+                    })
                 } else {
                     None
                 };
@@ -792,7 +789,22 @@ impl Executor {
                         Ok(executed) => {
                             state.mark_completed(&path);
                             state.report_task_finished(&path, true);
-                            Ok((path, executed, cache_key))
+
+                            // The depfile only exists after the first compile.
+                            // Recompute the key now so that build can still
+                            // populate the cache with header-aware inputs.
+                            let store_key = if executed {
+                                cache_key_for(
+                                    command.as_deref().unwrap_or_default(),
+                                    &deps,
+                                    &depfile,
+                                    &env_vars,
+                                )
+                            } else {
+                                cache_key
+                            };
+
+                            Ok((path, executed, store_key))
                         }
                         Err(e) => {
                             state.mark_failed(&path);
@@ -925,6 +937,41 @@ impl Executor {
             }
         }
     }
+}
+
+/// Compute a cache key from the manifest inputs plus any headers recorded in
+/// the depfile. Returns `None` when the depfile is unavailable or one of its
+/// inputs is missing, in which case the caller must not use the cache.
+fn cache_key_for(
+    command: &str,
+    deps: &[String],
+    depfile: &str,
+    env_vars: &[(&str, String)],
+) -> Option<String> {
+    let mut inputs = deps.to_vec();
+
+    if !depfile.is_empty() {
+        let parsed = depfile::parse(depfile).ok()?;
+        for dep in parsed.deps {
+            // A missing header makes the key ambiguous. Skipping the cache is
+            // safer than risking a stale hit.
+            if !Path::new(&dep).exists() {
+                return None;
+            }
+            inputs.push(dep);
+        }
+    }
+
+    inputs.sort();
+    inputs.dedup();
+
+    let input_paths: Vec<&Path> = inputs.iter().map(|p| Path::new(p.as_str())).collect();
+    let env_refs: Vec<(&str, &str)> = env_vars
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+
+    crate::cache::compute_action_key(command, &input_paths, &env_refs).ok()
 }
 
 /// Check whether a node's recorded depfile dependencies require a rebuild.
@@ -1233,6 +1280,37 @@ mod tests {
         assert_eq!(
             NodeState::Ready.transition(NodeState::Failed).unwrap(),
             NodeState::Failed
+        );
+    }
+
+    #[test]
+    fn test_cache_key_includes_depfile_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.c");
+        let header = dir.path().join("config.h");
+        let depfile = dir.path().join("main.o.d");
+
+        std::fs::write(&source, "int main(void) { return 0; }").unwrap();
+        std::fs::write(&header, "#define VALUE 1\n").unwrap();
+        std::fs::write(
+            &depfile,
+            format!("main.o: {} {}\n", source.display(), header.display()),
+        )
+        .unwrap();
+
+        let deps = vec![source.to_string_lossy().into_owned()];
+        let depfile = depfile.to_str().unwrap();
+
+        let first = cache_key_for("cc", &deps, depfile, &[]).unwrap();
+
+        std::fs::write(&header, "#define VALUE 2\n").unwrap();
+        let second = cache_key_for("cc", &deps, depfile, &[]).unwrap();
+        assert_ne!(first, second, "header content must affect the cache key");
+
+        std::fs::remove_file(&header).unwrap();
+        assert!(
+            cache_key_for("cc", &deps, depfile, &[]).is_none(),
+            "missing depfile inputs must disable the cache"
         );
     }
 

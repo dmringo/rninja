@@ -8,6 +8,7 @@ pub mod schema;
 pub use blob::BlobStore;
 pub use config::{CacheConfig, CacheMode, PullPolicy, PushPolicy, RemoteCacheConfig};
 pub use entry::CacheEntry;
+pub(crate) use hasher::compute_action_key;
 pub use remote::{RemoteCacheClient, RemoteCacheError, RemoteClientConfig, WireCacheEntry};
 pub use schema::{check_and_migrate, SchemaInfo, CURRENT_SCHEMA_VERSION};
 
