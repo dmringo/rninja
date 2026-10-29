@@ -242,6 +242,42 @@ impl Graph {
         self.nodes.get(target).map(|n| &n.deps)
     }
 
+    /// Dependencies used for scheduling.
+    ///
+    /// Phony nodes have no command and are never scheduled themselves, so they
+    /// are replaced by their own dependencies, recursively. This preserves the
+    /// ordering guarantees of phony intermediates such as CMake's
+    /// `cmake_object_order_depends_*` targets without making their dependents
+    /// rebuild just because a phony node is "dirty".
+    pub fn scheduling_deps(&self, node: &Node) -> Vec<String> {
+        let mut deps = Vec::new();
+        let mut seen = HashSet::new();
+        self.collect_scheduling_deps(node, &mut seen, &mut deps);
+        deps
+    }
+
+    fn collect_scheduling_deps(
+        &self,
+        node: &Node,
+        seen: &mut HashSet<String>,
+        deps: &mut Vec<String>,
+    ) {
+        for dep in &node.deps {
+            if let Some(dep_node) = self.nodes.get(dep) {
+                if dep_node.is_phony {
+                    if seen.insert(dep.clone()) {
+                        self.collect_scheduling_deps(dep_node, seen, deps);
+                    }
+                    continue;
+                }
+            }
+
+            if seen.insert(dep.clone()) {
+                deps.push(dep.clone());
+            }
+        }
+    }
+
     /// Get all outputs that depend on a given target
     pub fn outputs_for(&self, target: &str) -> Vec<&str> {
         self.nodes
@@ -562,6 +598,31 @@ build prog: link foo.o bar.o
 
         assert!(foo_idx < prog_idx);
         assert!(bar_idx < prog_idx);
+    }
+
+    #[test]
+    fn test_scheduling_deps_expand_phony_intermediates() {
+        let content = r#"
+rule cc
+    command = cc -c $in -o $out
+rule gen
+    command = gen $out
+
+build generated.h: gen
+build gen_alias: phony || generated.h
+build nested_alias: phony || gen_alias
+build empty_alias: phony
+build main.o: cc main.cpp || nested_alias empty_alias
+"#;
+        let manifest = parser::parse(content).unwrap();
+        let graph = Graph::from_manifest(&manifest).unwrap();
+
+        let deps = graph.scheduling_deps(graph.get_node("main.o").unwrap());
+        assert!(deps.contains(&"main.cpp".to_string()));
+        assert!(deps.contains(&"generated.h".to_string()));
+        assert!(!deps.contains(&"gen_alias".to_string()));
+        assert!(!deps.contains(&"nested_alias".to_string()));
+        assert!(!deps.contains(&"empty_alias".to_string()));
     }
 
     #[test]

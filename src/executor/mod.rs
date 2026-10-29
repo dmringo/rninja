@@ -1,6 +1,7 @@
-mod depfile;
+pub(crate) mod depfile;
 mod runner;
 
+use crate::buildlog::MtimeCache;
 use crate::cache::{Cache, CacheConfig};
 use crate::error::ExecError;
 use crate::graph::{Graph, Node};
@@ -10,7 +11,7 @@ use crate::trace::BuildTrace;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -477,6 +478,7 @@ impl Executor {
 
     async fn run_async(&self, graph: &Graph, targets: &[&str]) -> Result<Stats, ExecError> {
         let start = Instant::now();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         // Get all nodes in topological order
         let topo_order = graph
@@ -485,12 +487,22 @@ impl Executor {
 
         // Filter to nodes that need rebuilding
         let mut needs_build: HashSet<String> = HashSet::new();
+        let mut needs_build_paths: HashSet<PathBuf> = HashSet::new();
+        let mut mtime_cache = MtimeCache::new();
 
         // Mark nodes that need building. Walk in topological order (dependencies
         // first) so a dirty dependency propagates to its dependents.
         for node in topo_order.iter() {
-            let needs_it =
+            let mut needs_it =
                 node.needs_rebuild() || node.deps.iter().any(|d| needs_build.contains(d));
+
+            // Headers discovered by a previous compile are recorded in the
+            // depfile, not in the manifest. Include them in the rebuild check,
+            // and propagate generated dependencies that are themselves dirty.
+            if !needs_it {
+                needs_it =
+                    depfile_requires_rebuild(node, &cwd, &needs_build_paths, &mut mtime_cache);
+            }
 
             // Phony edges have no command, so they are never scheduled. Treat
             // them as satisfied aliases rather than dirty nodes: otherwise
@@ -498,6 +510,7 @@ impl Executor {
             // force every dependent edge to rebuild.
             if needs_it && !node.is_source && !node.is_phony {
                 needs_build.insert(node.path.clone());
+                needs_build_paths.insert(absolute_path(&cwd, Path::new(&node.path)));
                 if self.config.explain && node.needs_rebuild() {
                     self.explain_rebuild(node);
                 }
@@ -509,6 +522,15 @@ impl Executor {
             .iter()
             .filter(|n| needs_build.contains(&n.path))
             .copied()
+            .collect();
+
+        // Phony nodes are not scheduled, so expand them into their underlying
+        // dependencies when deciding whether a job's dependencies are ready.
+        // This is what makes CMake's `cmake_object_order_depends_*` phony
+        // targets actually order generated headers before object compiles.
+        let scheduling_deps: HashMap<String, Vec<String>> = work
+            .iter()
+            .map(|node| (node.path.clone(), graph.scheduling_deps(node)))
             .collect();
 
         let total = work.len();
@@ -591,7 +613,12 @@ impl Executor {
             let mut still_pending = Vec::new();
 
             for node in pending {
-                if state.has_failed_dep(&node.deps) {
+                let deps = scheduling_deps
+                    .get(&node.path)
+                    .map(Vec::as_slice)
+                    .unwrap_or(node.deps.as_slice());
+
+                if state.has_failed_dep(deps) {
                     // Skip nodes with failed dependencies. This is a
                     // cancellation, not a command failure, so it must not
                     // consume the keep-going budget.
@@ -599,7 +626,7 @@ impl Executor {
                     continue;
                 }
 
-                if state.deps_ready(&node.deps, graph) {
+                if state.deps_ready(deps, graph) {
                     ready.push(node);
                 } else {
                     still_pending.push(node);
@@ -898,6 +925,71 @@ impl Executor {
             }
         }
     }
+}
+
+/// Check whether a node's recorded depfile dependencies require a rebuild.
+///
+/// Compilers record headers that are not present in the manifest in a depfile.
+/// A missing or malformed depfile means the dependency information is
+/// unavailable, so the output cannot be trusted and must be rebuilt.
+fn depfile_requires_rebuild(
+    node: &Node,
+    cwd: &Path,
+    needs_build_paths: &HashSet<PathBuf>,
+    mtime_cache: &mut MtimeCache,
+) -> bool {
+    if node.depfile.is_empty() {
+        return false;
+    }
+
+    let parsed = match depfile::parse(&node.depfile) {
+        Ok(parsed) => parsed,
+        Err(_) => return true,
+    };
+
+    let output_mtime = mtime_cache.get(&absolute_path(cwd, Path::new(&node.path)));
+    for dep in &parsed.deps {
+        // Depfiles may use paths relative to the build directory or absolute
+        // paths, so normalize before comparing against scheduled outputs.
+        let dep_path = absolute_path(cwd, Path::new(dep));
+
+        // A generated header that is already scheduled to be rebuilt makes
+        // its dependents dirty even if the current file is still older.
+        if needs_build_paths.contains(&dep_path) {
+            return true;
+        }
+
+        match (mtime_cache.get(&dep_path), output_mtime) {
+            (Some(dep_mtime), Some(output_mtime)) if dep_mtime <= output_mtime => {}
+            _ => return true,
+        }
+    }
+
+    false
+}
+
+/// Resolve a path against the build directory for comparisons. Depfiles and
+/// manifests may mix relative and absolute forms of the same file.
+fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    // Normalize `.` and `..` components lexically so equivalent spellings
+    // compare equal without requiring the file to exist.
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Execute a single node asynchronously.

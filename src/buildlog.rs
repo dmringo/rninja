@@ -296,6 +296,14 @@ pub fn hash_command(cmd: &str) -> u64 {
     hasher.finish()
 }
 
+/// A node being checked, together with dependencies discovered from its
+/// previous compile.
+struct CheckNode<'a> {
+    output: &'a str,
+    node: &'a crate::graph::Node,
+    depfile_deps: Vec<String>,
+}
+
 /// Fast check if all targets are up-to-date (no tokio needed)
 /// Uses parallel stat() for large builds, sequential for small ones.
 pub fn quick_uptodate_check(
@@ -310,33 +318,54 @@ pub fn quick_uptodate_check(
         Err(_) => return false,
     };
 
-    // Collect nodes to check (non-source, non-phony)
-    let mut nodes_to_check: Vec<(&str, &crate::graph::Node)> = Vec::with_capacity(order.len());
+    // Collect nodes to check (non-source, non-phony), including headers
+    // recorded by the previous compile. A missing or malformed depfile means
+    // we cannot prove the output is up-to-date, so fall through to the
+    // executor.
+    let mut nodes_to_check: Vec<CheckNode> = Vec::with_capacity(order.len());
     let mut total_paths = 0;
 
     for node in &order {
-        if !node.is_source && !node.is_phony {
-            nodes_to_check.push((node.path.as_str(), node));
-            total_paths += 1 + node.deps.len();
+        if node.is_source || node.is_phony {
+            continue;
         }
+
+        let depfile_deps = if node.depfile.is_empty() {
+            Vec::new()
+        } else {
+            match crate::executor::depfile::parse(&node.depfile) {
+                Ok(parsed) => parsed.deps.into_iter().collect(),
+                Err(_) => return false,
+            }
+        };
+
+        total_paths += 1 + node.deps.len() + depfile_deps.len();
+        nodes_to_check.push(CheckNode {
+            output: node.path.as_str(),
+            node,
+            depfile_deps,
+        });
     }
 
     // Use parallel stat() for large builds (> 2000 paths), sequential otherwise
     if total_paths > 2000 {
-        quick_uptodate_check_parallel(nodes_to_check, log)
+        quick_uptodate_check_parallel(&nodes_to_check, log)
     } else {
-        quick_uptodate_check_sequential(nodes_to_check, log, mtime_cache)
+        quick_uptodate_check_sequential(&nodes_to_check, log, mtime_cache)
     }
 }
 
 /// Sequential up-to-date check for smaller builds
 #[inline]
 fn quick_uptodate_check_sequential(
-    nodes_to_check: Vec<(&str, &crate::graph::Node)>,
+    nodes_to_check: &[CheckNode],
     log: &BuildLog,
     mtime_cache: &mut MtimeCache,
 ) -> bool {
-    for (output, node) in nodes_to_check {
+    for check in nodes_to_check {
+        let output = check.output;
+        let node = check.node;
+
         // Check output exists
         let output_path = Path::new(output);
         let output_mtime = match mtime_cache.get(output_path) {
@@ -353,7 +382,7 @@ fn quick_uptodate_check_sequential(
             }
         }
 
-        // Check all inputs are older than output
+        // Check all manifest inputs are older than output
         for dep in &node.deps {
             let dep_path = Path::new(dep.as_str());
             if let Some(dep_mtime) = mtime_cache.get(dep_path) {
@@ -362,23 +391,32 @@ fn quick_uptodate_check_sequential(
                 }
             }
         }
+
+        // Depfile dependencies are real inputs; unlike phony paths, they must
+        // exist and be no newer than the output.
+        for dep in &check.depfile_deps {
+            match mtime_cache.get(Path::new(dep.as_str())) {
+                Some(dep_mtime) if dep_mtime <= output_mtime => {}
+                _ => return false,
+            }
+        }
     }
 
     true
 }
 
 /// Parallel up-to-date check for large builds
-fn quick_uptodate_check_parallel(
-    nodes_to_check: Vec<(&str, &crate::graph::Node)>,
-    log: &BuildLog,
-) -> bool {
+fn quick_uptodate_check_parallel(nodes_to_check: &[CheckNode], log: &BuildLog) -> bool {
     use rayon::prelude::*;
 
     // Collect all unique paths we need to stat
     let mut all_paths: Vec<&str> = Vec::with_capacity(nodes_to_check.len() * 3);
-    for (output, node) in &nodes_to_check {
-        all_paths.push(*output);
-        for dep in &node.deps {
+    for check in nodes_to_check {
+        all_paths.push(check.output);
+        for dep in &check.node.deps {
+            all_paths.push(dep.as_str());
+        }
+        for dep in &check.depfile_deps {
             all_paths.push(dep.as_str());
         }
     }
@@ -390,7 +428,10 @@ fn quick_uptodate_check_parallel(
         .collect();
 
     // Now check each node using cached mtimes
-    for (output, node) in nodes_to_check {
+    for check in nodes_to_check {
+        let output = check.output;
+        let node = check.node;
+
         // Check output exists
         let output_mtime = match mtimes.get(output) {
             Some(Some(m)) => *m,
@@ -406,12 +447,20 @@ fn quick_uptodate_check_parallel(
             }
         }
 
-        // Check all inputs are older than output
+        // Check all manifest inputs are older than output
         for dep in &node.deps {
             if let Some(Some(dep_mtime)) = mtimes.get(dep.as_str()) {
                 if *dep_mtime > output_mtime {
                     return false;
                 }
+            }
+        }
+
+        // Depfile dependencies must exist and be no newer than the output.
+        for dep in &check.depfile_deps {
+            match mtimes.get(dep.as_str()) {
+                Some(Some(dep_mtime)) if *dep_mtime <= output_mtime => {}
+                _ => return false,
             }
         }
     }
