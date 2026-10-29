@@ -26,9 +26,9 @@ run_test() {
     echo ""
 
     if bash "$script"; then
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
     else
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
     echo ""
 }

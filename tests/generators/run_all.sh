@@ -26,14 +26,14 @@ run_test() {
     echo -e "${YELLOW}Running $name test...${NC}"
 
     if bash "$script"; then
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
         echo ""
     else
         exit_code=$?
         if [[ $exit_code -eq 0 ]]; then
-            ((SKIPPED++))
+            SKIPPED=$((SKIPPED + 1))
         else
-            ((FAILED++))
+            FAILED=$((FAILED + 1))
         fi
         echo ""
     fi

@@ -39,13 +39,13 @@ run_suite() {
 
     if [[ -x "$script" ]]; then
         if bash "$script"; then
-            ((TOTAL_PASSED++))
+            TOTAL_PASSED=$((TOTAL_PASSED + 1))
         else
-            ((TOTAL_FAILED++))
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
         fi
     else
         echo -e "${YELLOW}SKIP: $script not found${NC}"
-        ((TOTAL_SKIPPED++))
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
     fi
     echo ""
 }
