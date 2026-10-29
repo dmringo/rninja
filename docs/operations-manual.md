@@ -294,6 +294,13 @@ To watch the live tree against a generated nested graph (requires a terminal):
 tests/manual/progress_tree_demo.sh
 ```
 
+The tree only shows live work: tasks that are queued but not yet executing
+stay hidden, along with branches that have no running or failed descendant.
+As tasks start their branches appear, and as they finish they disappear. Each
+running task displays its elapsed execution time once it has run for at least
+a second (for example `GEN obj/shared.txt (1.5s)`), measured from the moment
+the task actually started rather than from when it became ready.
+
 The tree is transient and is replaced at the end by a summary such as
 `ninja: finished 9 tasks` (with a cache count when applicable).
 

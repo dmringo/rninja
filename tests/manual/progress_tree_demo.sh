@@ -7,7 +7,10 @@
 #   tests/manual/progress_tree_demo.sh [extra rninja args...]
 #
 # The graph has three levels of dependencies, a shared dependency, and two
-# nested phony aliases, so the live tree shows branch counts and pruning:
+# nested phony aliases, so the live tree shows branch counts and pruning.
+# Only tasks that are actually executing (plus their ancestors) are drawn, so
+# the initial view is just the root. The full shape, reached once everything
+# along these paths is running, is:
 #
 #   [0/9] build
 #   `- [0/9] check
@@ -21,6 +24,10 @@
 #            `- [0/3] GEN lib/extra.txt
 #               `- [0/2] GEN obj/b.txt
 #                  `- [0/1] GEN src/deep/three.txt
+#
+# Queued tasks stay hidden until they start, and finished tasks disappear.
+# Running tasks show their elapsed execution time once they have been running
+# for at least a second, for example `GEN obj/shared.txt (1.5s)`.
 #
 # `obj/shared.txt` is a shared dependency: it appears once, under obj/a.txt,
 # and is not duplicated under obj/b.txt.
