@@ -586,8 +586,14 @@ impl Executor {
             if needs_it && !node.is_source && !node.is_phony {
                 needs_build.insert(node.path.clone());
                 needs_build_paths.insert(absolute_path(&cwd, Path::new(&node.path)));
-                if self.config.explain && node.needs_rebuild() {
-                    self.explain_rebuild(node);
+                if self.config.explain {
+                    self.explain_rebuild(
+                        node,
+                        &needs_build,
+                        &needs_build_paths,
+                        &cwd,
+                        &mut mtime_cache,
+                    );
                 }
             }
         }
@@ -1012,30 +1018,75 @@ impl Executor {
         }
     }
 
-    fn explain_rebuild(&self, node: &Node) {
-        if !std::path::Path::new(&node.path).exists() {
+    fn explain_rebuild(
+        &self,
+        node: &Node,
+        needs_build: &HashSet<String>,
+        needs_build_paths: &HashSet<PathBuf>,
+        cwd: &Path,
+        mtime_cache: &mut MtimeCache,
+    ) {
+        if !Path::new(&node.path).exists() {
             println!("ninja explain: {} is missing", node.path);
             return;
         }
 
-        let output_mtime = std::path::Path::new(&node.path)
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok();
+        let output_mtime = mtime_cache.get(Path::new(&node.path));
 
         for dep in &node.deps {
-            let dep_mtime = std::path::Path::new(dep)
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok();
+            if needs_build.contains(dep) {
+                println!("ninja explain: {} is dirty", dep);
+                return;
+            }
 
-            if let (Some(out_t), Some(dep_t)) = (output_mtime, dep_mtime) {
+            if let (Some(out_t), Some(dep_t)) = (output_mtime, mtime_cache.get(Path::new(dep))) {
                 if dep_t > out_t {
                     println!("ninja explain: {} is newer than {}", dep, node.path);
                     return;
                 }
             }
         }
+
+        if !node.depfile.is_empty() {
+            match depfile::parse(&node.depfile) {
+                Ok(parsed) => {
+                    for dep in &parsed.deps {
+                        let dep_path = absolute_path(cwd, Path::new(dep));
+
+                        if needs_build_paths.contains(&dep_path) {
+                            println!("ninja explain: {} is dirty", dep);
+                            return;
+                        }
+
+                        match (mtime_cache.get(&dep_path), output_mtime) {
+                            (Some(dep_t), Some(out_t)) => {
+                                if dep_t > out_t {
+                                    println!("ninja explain: {} is newer than {}", dep, node.path);
+                                    return;
+                                }
+                            }
+                            (None, _) => {
+                                println!("ninja explain: {} is missing", dep);
+                                return;
+                            }
+                            (Some(_), None) => {
+                                println!("ninja explain: {} is missing or unreadable", node.path);
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!(
+                        "ninja explain: depfile {} is missing or unreadable for {}",
+                        node.depfile, node.path
+                    );
+                    return;
+                }
+            }
+        }
+
+        println!("ninja explain: {} is dirty", node.path);
     }
 }
 
