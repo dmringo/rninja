@@ -10,6 +10,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod depslog;
 pub mod error;
 pub mod executor;
 pub mod graph;

@@ -5,15 +5,11 @@ pub use node::Node;
 use crate::error::GraphError;
 use crate::parser::{Build, Manifest, Rule};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
-/// Hash a command string for quick comparison
+/// Hash a command string for quick comparison and Ninja log compatibility.
 #[inline]
 fn hash_command(cmd: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    cmd.hash(&mut hasher);
-    hasher.finish()
+    crate::buildlog::hash_command(cmd)
 }
 
 /// The build graph - a DAG of nodes representing build targets

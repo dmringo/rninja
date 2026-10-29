@@ -1,8 +1,9 @@
 pub(crate) mod depfile;
 mod runner;
 
-use crate::buildlog::MtimeCache;
+use crate::buildlog::{get_ninja_mtime, BuildLog, MtimeCache};
 use crate::cache::{Cache, CacheConfig};
+use crate::depslog::DepsLog;
 use crate::error::ExecError;
 use crate::graph::{Graph, Node};
 use crate::output::{JsonEvent, OutputMode};
@@ -230,9 +231,16 @@ struct BuildState {
     tree_progress: Option<Arc<TreeProgress>>,
     /// Build trace for chrome://tracing output
     trace: Arc<BuildTrace>,
+    /// Ninja-compatible build log
+    build_log: Mutex<BuildLog>,
+    /// Ninja-compatible dependency log
+    deps_log: Mutex<DepsLog>,
+    /// Start of this build, used for Ninja-compatible log timestamps
+    start: Instant,
 }
 
 impl BuildState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         parallelism: usize,
         total: usize,
@@ -240,6 +248,8 @@ impl BuildState {
         output_mode: OutputMode,
         tree_progress: Option<Arc<TreeProgress>>,
         trace: Arc<BuildTrace>,
+        build_log: BuildLog,
+        deps_log: DepsLog,
     ) -> Self {
         let mut pool_sems = HashMap::new();
         for (name, depth) in pools {
@@ -262,7 +272,14 @@ impl BuildState {
             output_mode,
             tree_progress,
             trace,
+            build_log: Mutex::new(build_log),
+            deps_log: Mutex::new(deps_log),
+            start: Instant::now(),
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 
     fn apply_transition(&self, path: &str, new: NodeState) {
@@ -315,6 +332,34 @@ impl BuildState {
 
     fn kill_requested(&self) -> bool {
         self.kill_requested.load(Ordering::SeqCst)
+    }
+
+    fn record_build(&self, path: &str, command_hash: u64, start_ms: u64, end_ms: u64) {
+        self.build_log
+            .lock()
+            .record(path, command_hash, start_ms, end_ms);
+    }
+
+    fn record_deps(&self, path: &str, deps: &[String]) {
+        let Some(mtime) = get_ninja_mtime(Path::new(path)) else {
+            return;
+        };
+        if let Err(e) = self.deps_log.lock().record(path, mtime, deps) {
+            debug!("Failed to record dependencies for {}: {}", path, e);
+        }
+    }
+
+    /// Re-record existing dependency data for a restored output so its mtime
+    /// matches the newly written file.
+    fn refresh_deps_mtime(&self, path: &str) {
+        let deps = self
+            .deps_log
+            .lock()
+            .get(path)
+            .map(|entry| entry.deps.clone());
+        if let Some(deps) = deps {
+            self.record_deps(path, &deps);
+        }
     }
 
     fn register_process(&self, path: &str, pid: u32) {
@@ -554,6 +599,8 @@ impl Executor {
     async fn run_async(&self, graph: &Graph, targets: &[&str]) -> Result<Stats, ExecError> {
         let start = Instant::now();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let build_log = BuildLog::open(&cwd);
+        let deps_log = DepsLog::open(&cwd);
 
         // Get all nodes in topological order
         let topo_order = graph
@@ -575,8 +622,13 @@ impl Executor {
             // depfile, not in the manifest. Include them in the rebuild check,
             // and propagate generated dependencies that are themselves dirty.
             if !needs_it {
-                needs_it =
-                    depfile_requires_rebuild(node, &cwd, &needs_build_paths, &mut mtime_cache);
+                needs_it = depfile_requires_rebuild(
+                    node,
+                    &cwd,
+                    &needs_build_paths,
+                    &deps_log,
+                    &mut mtime_cache,
+                );
             }
 
             // Phony edges have no command, so they are never scheduled. Treat
@@ -592,6 +644,7 @@ impl Executor {
                         &needs_build,
                         &needs_build_paths,
                         &cwd,
+                        &deps_log,
                         &mut mtime_cache,
                     );
                 }
@@ -663,6 +716,8 @@ impl Executor {
             self.config.output_mode,
             tree_progress,
             trace.clone(),
+            build_log,
+            deps_log,
         ));
 
         // Nodes that don't need rebuilding will never be scheduled, so mark
@@ -746,6 +801,7 @@ impl Executor {
                 let rspfile_content = node.rspfile_content.clone();
                 let pool = node.pool.clone();
                 let deps = node.deps.clone();
+                let command_hash = node.command_hash;
 
                 // Collect environment variables that affect the build
                 let env_vars = collect_relevant_env_vars();
@@ -789,6 +845,20 @@ impl Executor {
                 }
 
                 if restored {
+                    // A cache hit is a successful build as far as Ninja's
+                    // logs are concerned.
+                    state.record_build(&path, command_hash, 0, 0);
+                    if !depfile.is_empty() {
+                        if let Ok(parsed) = depfile::parse(&depfile) {
+                            let deps: Vec<String> = parsed.deps.into_iter().collect();
+                            state.record_deps(&path, &deps);
+                        } else {
+                            state.refresh_deps_mtime(&path);
+                        }
+                    } else {
+                        state.refresh_deps_mtime(&path);
+                    }
+
                     // Emit cache hit output and trace inline (no task spawn)
                     let idx = state.next_progress();
                     match state.output_mode {
@@ -855,6 +925,7 @@ impl Executor {
                     let tid = state.allocate_tid();
                     let trace_start = state.trace.timestamp();
                     let exec_start = Instant::now();
+                    let build_start_ms = state.elapsed_ms();
 
                     let result = execute_node_async(
                         &path,
@@ -889,6 +960,14 @@ impl Executor {
 
                     match result {
                         Ok(executed) => {
+                            if executed {
+                                state.record_build(
+                                    &path,
+                                    command_hash,
+                                    build_start_ms,
+                                    state.elapsed_ms(),
+                                );
+                            }
                             state.mark_completed(&path);
                             state.report_task_finished(&path, true);
 
@@ -1024,6 +1103,7 @@ impl Executor {
         needs_build: &HashSet<String>,
         needs_build_paths: &HashSet<PathBuf>,
         cwd: &Path,
+        deps_log: &DepsLog,
         mtime_cache: &mut MtimeCache,
     ) {
         if !Path::new(&node.path).exists() {
@@ -1047,43 +1127,70 @@ impl Executor {
             }
         }
 
-        if !node.depfile.is_empty() {
+        let current_ninja_mtime = get_ninja_mtime(Path::new(&node.path));
+        let discovered: Option<Vec<String>> = if !node.depfile.is_empty() {
             match depfile::parse(&node.depfile) {
-                Ok(parsed) => {
-                    for dep in &parsed.deps {
-                        let dep_path = absolute_path(cwd, Path::new(dep));
-
-                        if needs_build_paths.contains(&dep_path) {
-                            println!("ninja explain: {} is dirty", dep);
-                            return;
-                        }
-
-                        match (mtime_cache.get(&dep_path), output_mtime) {
-                            (Some(dep_t), Some(out_t)) => {
-                                if dep_t > out_t {
-                                    println!("ninja explain: {} is newer than {}", dep, node.path);
-                                    return;
-                                }
-                            }
-                            (None, _) => {
-                                println!("ninja explain: {} is missing", dep);
-                                return;
-                            }
-                            (Some(_), None) => {
-                                println!("ninja explain: {} is missing or unreadable", node.path);
-                                return;
-                            }
-                        }
+                Ok(parsed) => Some(parsed.deps.into_iter().collect()),
+                Err(_) => match deps_log.get(&node.path) {
+                    Some(entry) if current_ninja_mtime == Some(entry.mtime) => {
+                        Some(entry.deps.clone())
                     }
-                }
-                Err(_) => {
+                    Some(_) => {
+                        println!(
+                            "ninja explain: stored deps info is out of date for {}",
+                            node.path
+                        );
+                        return;
+                    }
+                    None => None,
+                },
+            }
+        } else {
+            match deps_log.get(&node.path) {
+                Some(entry) if current_ninja_mtime == Some(entry.mtime) => Some(entry.deps.clone()),
+                Some(_) => {
                     println!(
-                        "ninja explain: depfile {} is missing or unreadable for {}",
-                        node.depfile, node.path
+                        "ninja explain: stored deps info is out of date for {}",
+                        node.path
                     );
                     return;
                 }
+                None => None,
             }
+        };
+
+        if let Some(deps) = discovered {
+            for dep in &deps {
+                let dep_path = absolute_path(cwd, Path::new(dep.as_str()));
+
+                if needs_build_paths.contains(&dep_path) {
+                    println!("ninja explain: {} is dirty", dep);
+                    return;
+                }
+
+                match (mtime_cache.get(&dep_path), output_mtime) {
+                    (Some(dep_t), Some(out_t)) => {
+                        if dep_t > out_t {
+                            println!("ninja explain: {} is newer than {}", dep, node.path);
+                            return;
+                        }
+                    }
+                    (None, _) => {
+                        println!("ninja explain: {} is missing", dep);
+                        return;
+                    }
+                    (Some(_), None) => {
+                        println!("ninja explain: {} is missing or unreadable", node.path);
+                        return;
+                    }
+                }
+            }
+        } else if !node.depfile.is_empty() {
+            println!(
+                "ninja explain: depfile {} is missing or unreadable for {}",
+                node.depfile, node.path
+            );
+            return;
         }
 
         println!("ninja explain: {} is dirty", node.path);
@@ -1134,22 +1241,44 @@ fn depfile_requires_rebuild(
     node: &Node,
     cwd: &Path,
     needs_build_paths: &HashSet<PathBuf>,
+    deps_log: &DepsLog,
     mtime_cache: &mut MtimeCache,
 ) -> bool {
-    if node.depfile.is_empty() {
+    let deps: Vec<String> = if !node.depfile.is_empty() {
+        match depfile::parse(&node.depfile) {
+            Ok(parsed) => parsed.deps.into_iter().collect(),
+            Err(_) => {
+                // Ninja deletes depfiles after storing them in .ninja_deps.
+                let current = get_ninja_mtime(Path::new(&node.path));
+                match current.and_then(|mtime| deps_log.get_if_current(&node.path, mtime)) {
+                    Some(entry) => entry.deps.clone(),
+                    None => return true,
+                }
+            }
+        }
+    } else {
+        // Rules using deps=msvc have no depfile but may have a deps log entry.
+        match deps_log.get(&node.path) {
+            Some(entry) => {
+                let current = get_ninja_mtime(Path::new(&node.path));
+                if current != Some(entry.mtime) {
+                    return true;
+                }
+                entry.deps.clone()
+            }
+            None => Vec::new(),
+        }
+    };
+
+    if deps.is_empty() {
         return false;
     }
 
-    let parsed = match depfile::parse(&node.depfile) {
-        Ok(parsed) => parsed,
-        Err(_) => return true,
-    };
-
     let output_mtime = mtime_cache.get(&absolute_path(cwd, Path::new(&node.path)));
-    for dep in &parsed.deps {
+    for dep in &deps {
         // Depfiles may use paths relative to the build directory or absolute
         // paths, so normalize before comparing against scheduled outputs.
-        let dep_path = absolute_path(cwd, Path::new(dep));
+        let dep_path = absolute_path(cwd, Path::new(dep.as_str()));
 
         // A generated header that is already scheduled to be rebuilt makes
         // its dependents dirty even if the current file is still older.
@@ -1287,8 +1416,13 @@ async fn execute_node_async(
 
     // Parse depfile if present
     if !depfile.is_empty() {
-        if let Ok(deps) = depfile::parse(depfile) {
-            debug!("Parsed depfile {}: {:?}", depfile, deps);
+        if let Ok(parsed) = depfile::parse(depfile) {
+            if success {
+                let deps: Vec<String> = parsed.deps.into_iter().collect();
+                state.record_deps(path, &deps);
+            } else {
+                debug!("Parsed depfile {}: {:?}", depfile, parsed.deps);
+            }
         }
     }
 
@@ -1512,6 +1646,7 @@ mod tests {
 
     #[test]
     fn test_spawn_command_captures_stdout_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
         let state = BuildState::new(
             1,
             1,
@@ -1519,6 +1654,8 @@ mod tests {
             OutputMode::Human,
             None,
             Arc::new(BuildTrace::new(false)),
+            BuildLog::open(dir.path()),
+            DepsLog::open(dir.path()),
         );
 
         #[cfg(windows)]

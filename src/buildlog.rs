@@ -13,15 +13,15 @@ use tracing::warn;
 /// Entry in the build log
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    /// Start time of the build (ms since epoch, for ninja compat)
+    /// Start time in milliseconds relative to the build start (Ninja format)
     pub start_time_ms: u64,
-    /// End time of the build
+    /// End time in milliseconds relative to the build start (Ninja format)
     pub end_time_ms: u64,
-    /// Mtime of the output after build (ns since epoch)
+    /// Output mtime in Ninja's `TimeStamp` units
     pub mtime_ns: u64,
     /// Output path
     pub output: String,
-    /// Hash of the command (for restat)
+    /// Ninja rapidhash of the command
     pub command_hash: u64,
 }
 
@@ -75,7 +75,7 @@ impl BuildLog {
                     parts[0].parse::<u64>(),
                     parts[1].parse::<u64>(),
                     parts[2].parse::<u64>(),
-                    parts[4].parse::<u64>(),
+                    u64::from_str_radix(parts[4], 16),
                 ) {
                     let output = parts[3].to_string();
                     self.entries.insert(
@@ -95,7 +95,7 @@ impl BuildLog {
 
     /// Record a build
     pub fn record(&mut self, output: &str, command_hash: u64, start_ms: u64, end_ms: u64) {
-        let mtime_ns = get_mtime_ns(Path::new(output)).unwrap_or(0);
+        let mtime_ns = get_ninja_mtime(Path::new(output)).unwrap_or(0) as u64;
 
         self.entries.insert(
             output.to_string(),
@@ -132,12 +132,12 @@ impl BuildLog {
             .truncate(true)
             .open(&self.path)?;
 
-        writeln!(file, "# ninja log v5")?;
+        writeln!(file, "# ninja log v7")?;
 
         for entry in self.entries.values() {
             writeln!(
                 file,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{:x}",
                 entry.start_time_ms,
                 entry.end_time_ms,
                 entry.mtime_ns,
@@ -165,7 +165,7 @@ impl BuildLog {
                 }
 
                 // Check if file mtime matches log
-                let current_mtime = get_mtime_ns(Path::new(output)).unwrap_or(0);
+                let current_mtime = get_ninja_mtime(Path::new(output)).unwrap_or(0) as u64;
                 if current_mtime == 0 {
                     return true; // File doesn't exist
                 }
@@ -260,6 +260,33 @@ impl Default for MtimeCache {
     }
 }
 
+/// Get a file mtime in Ninja's `TimeStamp` units.
+///
+/// On POSIX this is nanoseconds since the Unix epoch. On Windows it is the
+/// FILETIME value rebased to the 2000 epoch, matching Ninja's
+/// `TimeStampFromFileTime`.
+pub fn get_ninja_mtime(path: &Path) -> Option<i64> {
+    let metadata = std::fs::metadata(path).ok()?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(metadata.last_write_time() as i64 - 12_622_770_400i64 * 10_000_000)
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec())
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 /// Get file mtime in nanoseconds since epoch
 pub fn get_mtime_ns(path: &Path) -> Option<u64> {
     let metadata = match std::fs::metadata(path) {
@@ -286,14 +313,134 @@ pub fn get_mtime_ns(path: &Path) -> Option<u64> {
     Some(duration.as_nanos() as u64)
 }
 
-/// Hash a command string for log storage
-pub fn hash_command(cmd: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+const RAPID_SEED: u64 = 0xbdd89aa982704029;
+const RAPID_SECRET: [u64; 3] = [0x2d358dccaa6c78a5, 0x8bb84b93962eacc9, 0x4b33a62ed433d4a3];
 
-    let mut hasher = DefaultHasher::new();
-    cmd.hash(&mut hasher);
-    hasher.finish()
+fn rapid_mum(a: u64, b: u64) -> (u64, u64) {
+    let product = (a as u128) * (b as u128);
+    (product as u64, (product >> 64) as u64)
+}
+
+fn rapid_mix(a: u64, b: u64) -> u64 {
+    let (low, high) = rapid_mum(a, b);
+    low ^ high
+}
+
+fn read64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+fn read32(data: &[u8], offset: usize) -> u64 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as u64
+}
+
+fn read_small(data: &[u8], len: usize) -> u64 {
+    ((data[0] as u64) << 56) | ((data[len >> 1] as u64) << 32) | (data[len - 1] as u64)
+}
+
+/// Ninja's `rapidhash` command hash (used in `.ninja_log`).
+fn rapidhash(data: &[u8]) -> u64 {
+    let len = data.len();
+    let mut seed =
+        RAPID_SEED ^ rapid_mix(RAPID_SEED ^ RAPID_SECRET[0], RAPID_SECRET[1]) ^ (len as u64);
+    let (mut a, mut b);
+
+    if len <= 16 {
+        if len >= 4 {
+            let last = len - 4;
+            a = (read32(data, 0) << 32) | read32(data, last);
+            let delta = (len & 24) >> (len >> 3);
+            b = (read32(data, delta) << 32) | read32(data, last - delta);
+        } else if len > 0 {
+            a = read_small(data, len);
+            b = 0;
+        } else {
+            a = 0;
+            b = 0;
+        }
+    } else {
+        let mut remaining = len;
+        let mut offset = 0;
+
+        if remaining > 48 {
+            let mut see1 = seed;
+            let mut see2 = seed;
+
+            while remaining >= 96 {
+                seed = rapid_mix(
+                    read64(data, offset) ^ RAPID_SECRET[0],
+                    read64(data, offset + 8) ^ seed,
+                );
+                see1 = rapid_mix(
+                    read64(data, offset + 16) ^ RAPID_SECRET[1],
+                    read64(data, offset + 24) ^ see1,
+                );
+                see2 = rapid_mix(
+                    read64(data, offset + 32) ^ RAPID_SECRET[2],
+                    read64(data, offset + 40) ^ see2,
+                );
+                seed = rapid_mix(
+                    read64(data, offset + 48) ^ RAPID_SECRET[0],
+                    read64(data, offset + 56) ^ seed,
+                );
+                see1 = rapid_mix(
+                    read64(data, offset + 64) ^ RAPID_SECRET[1],
+                    read64(data, offset + 72) ^ see1,
+                );
+                see2 = rapid_mix(
+                    read64(data, offset + 80) ^ RAPID_SECRET[2],
+                    read64(data, offset + 88) ^ see2,
+                );
+                offset += 96;
+                remaining -= 96;
+            }
+
+            if remaining >= 48 {
+                seed = rapid_mix(
+                    read64(data, offset) ^ RAPID_SECRET[0],
+                    read64(data, offset + 8) ^ seed,
+                );
+                see1 = rapid_mix(
+                    read64(data, offset + 16) ^ RAPID_SECRET[1],
+                    read64(data, offset + 24) ^ see1,
+                );
+                see2 = rapid_mix(
+                    read64(data, offset + 32) ^ RAPID_SECRET[2],
+                    read64(data, offset + 40) ^ see2,
+                );
+                offset += 48;
+                remaining -= 48;
+            }
+
+            seed ^= see1 ^ see2;
+        }
+
+        if remaining > 16 {
+            seed = rapid_mix(
+                read64(data, offset) ^ RAPID_SECRET[2],
+                read64(data, offset + 8) ^ seed ^ RAPID_SECRET[1],
+            );
+            if remaining > 32 {
+                seed = rapid_mix(
+                    read64(data, offset + 16) ^ RAPID_SECRET[2],
+                    read64(data, offset + 24) ^ seed,
+                );
+            }
+        }
+
+        a = read64(data, offset + remaining - 16);
+        b = read64(data, offset + remaining - 8);
+    }
+
+    a ^= RAPID_SECRET[1];
+    b ^= seed;
+    let (low, high) = rapid_mum(a, b);
+    rapid_mix(low ^ RAPID_SECRET[0] ^ (len as u64), high ^ RAPID_SECRET[1])
+}
+
+/// Hash a command string for Ninja-compatible log storage.
+pub fn hash_command(cmd: &str) -> u64 {
+    rapidhash(cmd.as_bytes())
 }
 
 /// A node being checked, together with dependencies discovered from its
@@ -310,6 +457,7 @@ pub fn quick_uptodate_check(
     graph: &crate::graph::Graph,
     targets: &[&str],
     log: &BuildLog,
+    deps_log: &crate::depslog::DepsLog,
     mtime_cache: &mut MtimeCache,
 ) -> bool {
     // Get all nodes we'd need to build
@@ -330,13 +478,26 @@ pub fn quick_uptodate_check(
             continue;
         }
 
-        let depfile_deps = if node.depfile.is_empty() {
-            Vec::new()
-        } else {
+        // Ninja deletes depfiles after recording them in .ninja_deps, and
+        // rules using deps=msvc have no depfile at all. Prefer the depfile
+        // when present, otherwise use a current deps-log entry.
+        let current_mtime = get_ninja_mtime(Path::new(&node.path));
+        let log_deps = match deps_log.get(&node.path) {
+            Some(entry) if Some(entry.mtime) == current_mtime => Some(entry.deps.clone()),
+            Some(_) => return false, // stored deps are stale
+            None => None,
+        };
+
+        let depfile_deps = if !node.depfile.is_empty() {
             match crate::executor::depfile::parse(&node.depfile) {
                 Ok(parsed) => parsed.deps.into_iter().collect(),
-                Err(_) => return false,
+                Err(_) => match log_deps {
+                    Some(deps) => deps,
+                    None => return false,
+                },
             }
+        } else {
+            log_deps.unwrap_or_default()
         };
 
         total_paths += 1 + node.deps.len() + depfile_deps.len();
@@ -507,6 +668,12 @@ mod tests {
 
     #[test]
     fn test_hash_command() {
+        // Reference values from Ninja's rapidhash implementation.
+        assert_eq!(hash_command(""), 0x5a6ef77074ebc84b);
+        assert_eq!(hash_command("hello"), 0x1e5eabe786f5dbba);
+        assert_eq!(hash_command("gcc -c foo.c -o foo.o"), 0x671fc54922edb6f9);
+        assert_eq!(hash_command("cmd /C \"echo hi\""), 0x20458de11cc85e86);
+
         let h1 = hash_command("gcc -c foo.c -o foo.o");
         let h2 = hash_command("gcc -c foo.c -o foo.o");
         let h3 = hash_command("gcc -c bar.c -o bar.o");

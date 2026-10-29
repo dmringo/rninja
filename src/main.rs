@@ -9,6 +9,7 @@ mod buildlog;
 mod cache;
 mod cli;
 mod config;
+mod depslog;
 mod error;
 mod executor;
 mod graph;
@@ -74,9 +75,10 @@ fn run_build(cli: &Cli) -> Result<()> {
 
     // Fast path: check if everything is up-to-date without creating executor
     let log = buildlog::BuildLog::open(build_dir);
+    let deps_log = depslog::DepsLog::open(build_dir);
     let mut mtime_cache = buildlog::MtimeCache::new();
 
-    if buildlog::quick_uptodate_check(&graph, &targets, &log, &mut mtime_cache) {
+    if buildlog::quick_uptodate_check(&graph, &targets, &log, &deps_log, &mut mtime_cache) {
         if cli.json {
             output::JsonEvent::NoWorkToDo.emit();
         } else {
