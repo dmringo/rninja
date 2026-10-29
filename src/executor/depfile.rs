@@ -26,9 +26,9 @@ fn parse_content(content: &str) -> io::Result<DepfileResult> {
     // Join continuation lines
     let content = content.replace("\\\n", " ").replace("\\\r\n", " ");
 
-    // Split on first colon
-    let (target, deps) = content
-        .split_once(':')
+    // Split target from dependencies. Prefer the conventional ": " separator
+    // so a Windows drive prefix in an absolute target is not mistaken for it.
+    let (target, deps) = split_target(&content)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "depfile missing ':'"))?;
 
     result.target = target.trim().to_string();
@@ -72,6 +72,27 @@ fn parse_content(content: &str) -> io::Result<DepfileResult> {
     Ok(result)
 }
 
+fn split_target(content: &str) -> Option<(&str, &str)> {
+    if let Some(index) = content.find(": ") {
+        return Some((&content[..index], &content[index + 2..]));
+    }
+    if let Some(index) = content.find(":\t") {
+        return Some((&content[..index], &content[index + 2..]));
+    }
+
+    // No whitespace after the separator. Skip a leading Windows drive prefix
+    // (`C:`) before looking for the real colon.
+    let start = if content.len() > 1 && content.as_bytes()[1] == b':' {
+        2
+    } else {
+        0
+    };
+    content[start..].find(':').map(|offset| {
+        let index = start + offset;
+        (&content[..index], &content[index + 1..])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +120,31 @@ mod tests {
         let content = r"foo.o: path\ with\ spaces.c";
         let result = parse_content(content).unwrap();
         assert!(result.deps.contains("path with spaces.c"));
+    }
+
+    #[test]
+    fn test_absolute_windows_target() {
+        let content = r"C:\build\foo.o: C:\src\foo.c C:\src\foo.h";
+        let result = parse_content(content).unwrap();
+        assert_eq!(result.target, r"C:\build\foo.o");
+        assert!(result.deps.contains(r"C:\src\foo.c"));
+        assert!(result.deps.contains(r"C:\src\foo.h"));
+    }
+
+    #[test]
+    fn test_separator_without_space() {
+        let content = "foo.o:foo.c foo.h";
+        let result = parse_content(content).unwrap();
+        assert_eq!(result.target, "foo.o");
+        assert!(result.deps.contains("foo.c"));
+        assert!(result.deps.contains("foo.h"));
+    }
+
+    #[test]
+    fn test_colon_in_relative_target() {
+        let content = "dir:name/foo.o: foo.c";
+        let result = parse_content(content).unwrap();
+        assert_eq!(result.target, "dir:name/foo.o");
+        assert!(result.deps.contains("foo.c"));
     }
 }
