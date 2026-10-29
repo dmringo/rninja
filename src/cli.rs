@@ -21,9 +21,22 @@ pub struct Cli {
         short = 'k',
         long = "keep-going",
         value_name = "N",
-        default_value = "1"
+        conflicts_with = "kill_after"
     )]
-    pub keep_going: usize,
+    pub keep_going: Option<usize>,
+
+    /// Hard-kill mode: stop and kill running jobs after N failures
+    #[arg(
+        short = 'K',
+        long = "kill-after",
+        value_name = "N",
+        conflicts_with = "keep_going"
+    )]
+    pub kill_after: Option<usize>,
+
+    /// Kill already-running jobs when the keep-going failure limit is reached
+    #[arg(long = "kill-on-failure")]
+    pub kill_on_failure: bool,
 
     /// Do not start new jobs if the load average is greater than N
     #[arg(short = 'l', long = "load-average", value_name = "N")]

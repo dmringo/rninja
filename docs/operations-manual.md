@@ -279,6 +279,8 @@ rninja [OPTIONS] [TARGETS...]
 | `--quiet` | | Suppress output |
 | `--jobs N` | `-j N` | Parallel jobs (0=auto) |
 | `--keep-going N` | `-k N` | Stop after N failed jobs (default 1; 0 = unlimited) |
+| `--kill-after N` | `-K N` | Stop and kill running jobs after N failures (mutually exclusive with `-k`) |
+| `--kill-on-failure` | | Kill already-running jobs when the failure limit is reached |
 | `--dry-run` | `-n` | Don't execute commands |
 | `--explain` | | Explain why targets rebuild |
 | `--progress MODE` | | Progress display: `plain` (default) or `tree` (live dependency tree; interactive terminals only) |
@@ -291,6 +293,11 @@ rninja [OPTIONS] [TARGETS...]
 `-k` stops launching new jobs once the failure limit is reached, but jobs that
 are already running are allowed to finish. Up to `-j` failures can therefore be
 reported at once.
+
+Pass `--kill-on-failure` to terminate already-running jobs instead, or use
+`-K N` as shorthand for `-k N --kill-on-failure`. `-K` and `-k` are mutually
+exclusive. This is best effort: rninja tries to kill the child process tree,
+but some descendants may survive.
 
 To watch the live tree against a generated nested graph (requires a terminal):
 

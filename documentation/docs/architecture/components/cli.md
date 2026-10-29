@@ -39,6 +39,8 @@ the flags mirror upstream Ninja plus a few rninja-specific additions:
 | `-f FILE` / `--file`  | Yes              | Manifest path (default `build.ninja`) |
 | `-j N` / `--jobs`     | Yes              | Parallelism (`0` = unlimited)      |
 | `-k N` / `--keep-going` | Yes            | Stop after N failures              |
+| `-K N` / `--kill-after` | rninja extension | Stop and kill running jobs after N failures |
+| `--kill-on-failure`   | rninja extension | Kill running jobs at the failure limit |
 | `-l N` / `--load-average` | Yes          | Skip new jobs when load is high    |
 | `-n` / `--dry-run`    | Yes              | Print commands without running     |
 | `-v` / `--verbose`    | Yes              | Show full command lines            |

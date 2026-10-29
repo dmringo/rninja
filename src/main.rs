@@ -96,12 +96,17 @@ fn run_build(cli: &Cli) -> Result<()> {
         _ => progress::ProgressMode::Plain,
     };
 
+    // `-K N` is shorthand for `-k N --kill-on-failure`.
+    let keep_going = cli.kill_after.or(cli.keep_going).unwrap_or(1);
+    let kill_on_failure = cli.kill_on_failure || cli.kill_after.is_some();
+
     // Create executor and run
     let executor = executor::Executor::new(executor::Config {
         parallelism: cli.jobs.unwrap_or_else(num_cpus::get),
         dry_run: cli.dry_run,
         verbose: cli.verbose,
-        keep_going: cli.keep_going,
+        keep_going,
+        kill_on_failure,
         explain: cli.explain(),
         stats: cli.stats(),
         cache_config: cache::CacheConfig::from_env(),

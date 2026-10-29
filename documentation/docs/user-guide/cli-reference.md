@@ -51,6 +51,27 @@ rninja -k0      # never stop
 rninja -k5      # stop after 5 failures
 ```
 
+#### `-K, --kill-after <N>`
+
+Hard-kill mode: stop and terminate running jobs after N failures. This is
+shorthand for `-k N --kill-on-failure`, and is mutually exclusive with `-k`.
+
+```bash
+rninja -K1      # stop and kill after the first failure
+rninja -K5      # kill after five failures
+```
+
+#### `--kill-on-failure`
+
+When the `-k` limit is reached, terminate already-running jobs instead of
+letting them finish. This is best effort: rninja tries to kill the child
+process tree, but some descendants may survive. It has no effect with `-k0`.
+
+```bash
+rninja --kill-on-failure      # stop and kill after the first failure
+rninja -k5 --kill-on-failure  # kill after five failures
+```
+
 #### `-l, --load-average <N>`
 
 Do not start new jobs if the system load average is greater than N.

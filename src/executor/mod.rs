@@ -12,10 +12,9 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-#[cfg(not(windows))]
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
@@ -55,6 +54,8 @@ pub struct Config {
     pub verbose: bool,
     /// Maximum number of failed jobs before stopping (0 = unlimited)
     pub keep_going: usize,
+    /// Kill already-running jobs once the failure limit is reached
+    pub kill_on_failure: bool,
     /// Explain why targets are rebuilt
     pub explain: bool,
     /// Show stats at end
@@ -78,6 +79,7 @@ impl Default for Config {
             dry_run: false,
             verbose: false,
             keep_going: 1,
+            kill_on_failure: false,
             explain: false,
             stats: false,
             cache_config: CacheConfig::from_env(),
@@ -88,6 +90,12 @@ impl Default for Config {
         }
     }
 }
+
+/// Result returned by a spawned build task.
+type TaskResult = Result<(String, bool, Option<String>), (String, ExecError)>;
+
+/// Handle for a spawned build task.
+type TaskHandle = tokio::task::JoinHandle<TaskResult>;
 
 /// Build statistics
 #[derive(Debug, Default, Clone)]
@@ -195,6 +203,13 @@ struct BuildState {
     node_states: Mutex<HashMap<String, NodeState>>,
     /// Number of failures
     fail_count: AtomicUsize,
+    /// Number of jobs that were running when the build was aborted
+    cancelled_running: AtomicUsize,
+    /// Whether the build is being aborted and running commands should not be
+    /// reported as failures
+    kill_requested: AtomicBool,
+    /// PIDs of currently running child processes, keyed by target path
+    processes: Mutex<HashMap<String, u32>>,
     /// Counter for progress display
     progress: AtomicUsize,
     /// Total number of nodes to build
@@ -234,6 +249,9 @@ impl BuildState {
         Self {
             node_states: Mutex::new(HashMap::new()),
             fail_count: AtomicUsize::new(0),
+            cancelled_running: AtomicUsize::new(0),
+            kill_requested: AtomicBool::new(false),
+            processes: Mutex::new(HashMap::new()),
             progress: AtomicUsize::new(0),
             total,
             pools: pool_sems,
@@ -289,6 +307,62 @@ impl BuildState {
     /// tasks before they start executing.
     fn should_stop(&self, keep_going: usize) -> bool {
         keep_going > 0 && self.fail_count.load(Ordering::SeqCst) >= keep_going
+    }
+
+    fn request_kill(&self) {
+        self.kill_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn kill_requested(&self) -> bool {
+        self.kill_requested.load(Ordering::SeqCst)
+    }
+
+    fn register_process(&self, path: &str, pid: u32) {
+        self.processes.lock().insert(path.to_string(), pid);
+    }
+
+    fn unregister_process(&self, path: &str) {
+        self.processes.lock().remove(path);
+    }
+
+    /// Terminate every registered child process tree. Called after the task
+    /// handles have been aborted, so killed jobs are not reported as command
+    /// failures.
+    fn kill_running_processes(&self) {
+        let pids: Vec<u32> = std::mem::take(&mut *self.processes.lock())
+            .into_values()
+            .collect();
+
+        for pid in pids {
+            kill_process_tree(pid);
+        }
+    }
+
+    /// Mark every unfinished node as cancelled. Used when aborting the build
+    /// and killing already-running jobs; completed and failed nodes are left
+    /// alone.
+    fn cancel_unfinished<'a>(&self, paths: impl Iterator<Item = &'a str>) {
+        let mut states = self.node_states.lock();
+        let mut cancelled_running = 0;
+
+        for path in paths {
+            match states.get(path).copied().unwrap_or(NodeState::Pending) {
+                NodeState::Pending | NodeState::Ready => {
+                    states.insert(path.to_string(), NodeState::Cancelled);
+                }
+                NodeState::Running => {
+                    states.insert(path.to_string(), NodeState::Cancelled);
+                    cancelled_running += 1;
+                }
+                NodeState::Completed | NodeState::Failed | NodeState::Cancelled => {}
+            }
+        }
+
+        drop(states);
+        if cancelled_running > 0 {
+            self.cancelled_running
+                .fetch_add(cancelled_running, Ordering::SeqCst);
+        }
     }
 
     fn report_task_started(&self, path: &str) {
@@ -443,10 +517,7 @@ impl Executor {
     /// Handle the result of a completed task
     #[allow(clippy::type_complexity)]
     fn handle_task_result(
-        result: Result<
-            Result<(String, bool, Option<String>), (String, ExecError)>,
-            tokio::task::JoinError,
-        >,
+        result: Result<TaskResult, tokio::task::JoinError>,
         cache: &Option<Cache>,
         state: &BuildState,
     ) {
@@ -469,6 +540,10 @@ impl Executor {
                     message.push_str(&format!("Exit code: {}\n", code));
                 }
                 state.report_permanent_error(&message);
+            }
+            Err(e) if e.is_cancelled() => {
+                // The build was aborted and this task was cancelled; there is
+                // no command failure to report.
             }
             Err(e) => {
                 state.report_permanent_error(&format!("Task error: {}\n", e));
@@ -595,7 +670,7 @@ impl Executor {
         }
 
         // Execute nodes respecting dependencies
-        let mut handles = Vec::new();
+        let mut handles: Vec<TaskHandle> = Vec::new();
         let mut pending: Vec<&Node> = work.clone();
 
         while !pending.is_empty() || !handles.is_empty() {
@@ -604,6 +679,22 @@ impl Executor {
                 // Cancel remaining pending work
                 for node in &pending {
                     state.mark_cancelled(&node.path);
+                }
+
+                if self.config.kill_on_failure {
+                    // Flag first so tasks that finish while the tree is being
+                    // killed are treated as cancelled, not failed. Then kill
+                    // the process trees while the parent PIDs are still alive,
+                    // and finally abort any tasks still waiting.
+                    state.request_kill();
+                    state.kill_running_processes();
+                    for handle in &handles {
+                        handle.abort();
+                    }
+                    // Catch any child that registered while the first sweep was
+                    // running or while the tasks were being aborted.
+                    state.kill_running_processes();
+                    state.cancel_unfinished(work.iter().map(|node| node.path.as_str()));
                 }
                 break;
             }
@@ -785,6 +876,11 @@ impl Executor {
                         false,
                     );
 
+                    if state.kill_requested() {
+                        state.mark_cancelled(&path);
+                        return Ok((path, false, None));
+                    }
+
                     match result {
                         Ok(executed) => {
                             state.mark_completed(&path);
@@ -839,14 +935,18 @@ impl Executor {
 
         let fail_count = state.fail_count.load(Ordering::SeqCst);
         let finish_count = state.progress.load(Ordering::SeqCst);
+        let cancelled_running = state.cancelled_running.load(Ordering::SeqCst);
         let cache_hits = state.cache_hits.load(Ordering::SeqCst);
         let cache_misses = state.cache_misses.load(Ordering::SeqCst);
 
+        let completed = finish_count
+            .saturating_sub(fail_count)
+            .saturating_sub(cancelled_running);
         let stats = Stats {
             started: finish_count,
-            finished: finish_count.saturating_sub(fail_count),
+            finished: completed,
             failed: fail_count,
-            skipped: total.saturating_sub(finish_count),
+            skipped: total.saturating_sub(finish_count.saturating_sub(cancelled_running)),
             cache_hits,
             cache_misses,
             total_time: start.elapsed(),
@@ -858,7 +958,7 @@ impl Executor {
             // The tree is transient, so leave one permanent line confirming
             // that the build finished and how much work was done.
             if fail_count == 0 {
-                let done = finish_count.saturating_sub(fail_count);
+                let done = completed;
                 let noun = if done == 1 { "task" } else { "tasks" };
                 if cache_hits > 0 {
                     eprintln!(
@@ -879,7 +979,7 @@ impl Executor {
         if self.config.output_mode == OutputMode::Json {
             JsonEvent::BuildFinished {
                 success: fail_count == 0,
-                targets_built: finish_count,
+                targets_built: finish_count.saturating_sub(cancelled_running),
                 targets_total: total,
                 duration_ms: stats.total_time.as_millis() as u64,
                 cache_hits: if cache_hits > 0 {
@@ -1123,7 +1223,7 @@ async fn execute_node_async(
     }
 
     // Execute the command
-    let output = spawn_command(command).await?;
+    let output = spawn_command(command, path, state).await?;
     let success = output.status.success();
 
     // Print output if any, keeping the live progress tree intact. Tree mode
@@ -1198,28 +1298,66 @@ fn should_emit_output(tree_mode: bool, success: bool, verbose: bool) -> bool {
 /// command in an extra `cmd /C` breaks commands that already invoke
 /// `cmd.exe /C "..."` (as CMake does for linking) because the nested quotes
 /// get escaped twice.
-async fn spawn_command(command: &str) -> std::io::Result<std::process::Output> {
+async fn spawn_command(
+    command: &str,
+    path: &str,
+    state: &BuildState,
+) -> std::io::Result<std::process::Output> {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-
-        let command = command.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let (program, rest) = split_windows_program(&command);
-            let mut cmd = std::process::Command::new(program);
-            if !rest.is_empty() {
-                // Pass the remainder verbatim so existing quoting is preserved.
-                cmd.raw_arg(rest);
-            }
-            cmd.output()
-        })
-        .await
-        .map_err(std::io::Error::other)?
-    }
+    let mut cmd = {
+        let (program, rest) = split_windows_program(command);
+        let mut cmd = Command::new(program);
+        if !rest.is_empty() {
+            // Pass the remainder verbatim so existing quoting is preserved.
+            cmd.raw_arg(rest);
+        }
+        cmd
+    };
 
     #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        // Put the shell in its own process group so --kill-on-failure can
+        // terminate the whole tree with kill(-pid).
+        cmd.process_group(0);
+        cmd
+    };
+
+    // If the executor aborts this task (for example, with
+    // --kill-on-failure), dropping the future terminates the direct child.
+    cmd.kill_on_drop(true);
+
+    let child = cmd.spawn()?;
+    if let Some(pid) = child.id() {
+        state.register_process(path, pid);
+    }
+
+    let result = child.wait_with_output().await;
+    state.unregister_process(path);
+    result
+}
+
+/// Terminate a child process and its descendants. This is best effort:
+/// Windows uses `taskkill /T`, while Unix kills the process group created by
+/// `spawn_command`.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
     {
-        Command::new("sh").arg("-c").arg(command).output().await
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    {
+        // Negative PID targets the process group created in spawn_command.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
     }
 }
 

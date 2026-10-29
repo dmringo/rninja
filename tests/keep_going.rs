@@ -16,6 +16,11 @@ const FAIL_COMMAND: &str = "cmd /C exit /b 1";
 #[cfg(not(windows))]
 const FAIL_COMMAND: &str = "false";
 
+#[cfg(windows)]
+const SLOW_COMMAND: &str = "cmd /C \"ping -n 6 127.0.0.1 >nul\"";
+#[cfg(not(windows))]
+const SLOW_COMMAND: &str = "sleep 5";
+
 fn write_manifest(dir: &Path, manifest: &str) {
     fs::write(dir.join("build.ninja"), manifest).expect("write build.ninja");
 }
@@ -42,6 +47,17 @@ fn chain_manifest() -> String {
          build b: fail a\n\
          build c: fail b\n\
          build all: phony c\n\
+         default all\n"
+    )
+}
+
+fn kill_on_failure_manifest() -> String {
+    format!(
+        "rule fail\n  command = {FAIL_COMMAND}\n  description = FAIL $out\n\
+         rule slow\n  command = {SLOW_COMMAND}\n  description = SLOW $out\n\n\
+         build fail.txt: fail\n\
+         build slow.txt: slow\n\
+         build all: phony fail.txt slow.txt\n\
          default all\n"
     )
 }
@@ -156,6 +172,44 @@ fn parallel_keep_going_allows_only_in_flight_failures() {
     assert!(
         (1..=4).contains(&failed),
         "with -j 4 at most four already-running jobs may fail, got {failed}:\n{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn kill_after_conflicts_with_keep_going() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_manifest(dir.path(), &independent_manifest(1));
+
+    let output = run(dir.path(), &["-k", "1", "-K", "1"]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "expected a conflict error:\n{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn kill_on_failure_terminates_running_jobs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_manifest(dir.path(), &kill_on_failure_manifest());
+
+    let start = Instant::now();
+    let output = run(dir.path(), &["-j", "2", "-K", "1"]);
+    let elapsed = start.elapsed();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        failures(&output),
+        1,
+        "only the failing job should be reported:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "--kill-on-failure should not wait for the slow job; took {elapsed:?}:\n{}",
         stderr(&output)
     );
 }
