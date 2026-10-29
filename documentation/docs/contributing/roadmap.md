@@ -33,6 +33,8 @@ rninja is production-ready with core features:
 - [ ] S3-compatible storage backend
 - [ ] GCS storage backend
 - [ ] Cache warming tools
+  - [ ] Opt-in warming from already-up-to-date outputs (for example, a tree built by upstream Ninja), without re-running commands
+  - [ ] Provenance checks and cost controls so warming cannot quietly cache hand-edited or post-processed outputs
 - [ ] Better cache key debugging
 
 ### Usability
